@@ -30,3 +30,21 @@
 *.exe
 *.out
 *.app
+
+# Users Define ------------------------------------------------
+
+# temp file
+.vs/
+.vscode/
+.idea/
+.cache/
+
+# build folder
+build/
+x64/
+
+# clangd config
+.clang*
+
+# 3rdparty
+3rdparty/
