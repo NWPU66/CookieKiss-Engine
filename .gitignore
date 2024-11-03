@@ -47,4 +47,4 @@ x64/
 .clang*
 
 # 3rdparty
-3rdparty/
+# 3rdparty/
