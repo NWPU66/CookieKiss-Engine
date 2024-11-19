@@ -1,0 +1,40 @@
+# VulkanMiniPatchTracer
+set(DEMO_NAME VulkanMiniPatchTracer)
+
+# find dependency
+_add_package_VulkanSDK()
+_add_nvpro_core_lib()
+
+# Compile Shaders
+SET(VULKAN_TARGET_ENV vulkan1.3)
+UNSET(GLSL_SOURCES)
+UNSET(SPV_OUTPUT)
+file(GLOB_RECURSE GLSL_HEADER_FILES "Shaders/*.h")
+file(GLOB_RECURSE GLSL_SOURCE_FILES "Shaders/*.glsl")
+foreach(GLSL ${GLSL_SOURCE_FILES})
+    get_filename_component(FILE_NAME ${GLSL} NAME)
+    _compile_GLSL(${GLSL} "shaders/${FILE_NAME}.spv" GLSL_SOURCES SPV_OUTPUT)
+endforeach(GLSL)
+
+list(APPEND GLSL_SOURCES ${GLSL_HEADER_FILES})
+source_group("Shader Files" FILES ${GLSL_SOURCES})
+
+# Executable
+file(GLOB SOURCE_FILES *.cpp *.hpp *.inl *.h *.c)
+add_executable(${DEMO_NAME} ${SOURCE_FILES} ${COMMON_SOURCE_FILES} ${GLSL_SOURCES})
+source_group("Source Files" FILES ${SOURCE_FILES})
+
+# Linkage
+message(STATUS "Linking ${DEMO_NAME} with ${PLATFORM_LIBRARIES}; ${LIBRARIES_DEBUG}; ${LIBRARIES_OPTIMIZED}")
+target_link_libraries(${DEMO_NAME} ${PLATFORM_LIBRARIES} nvpro_core)
+target_include_directories(${DEMO_NAME} PRIVATE ${3rdparty}/nvpro_core ${3rdparty}/nvpro_core/nvp)
+
+foreach(DEBUGLIB ${LIBRARIES_DEBUG})
+  target_link_libraries(${DEMO_NAME} debug ${DEBUGLIB})
+endforeach(DEBUGLIB)
+
+foreach(RELEASELIB ${LIBRARIES_OPTIMIZED})
+  target_link_libraries(${DEMO_NAME} optimized ${RELEASELIB})
+endforeach(RELEASELIB)
+
+_finalize_target(${DEMO_NAME})

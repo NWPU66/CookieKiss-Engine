@@ -1,11 +1,11 @@
 set(SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 # add sub directories
-# subdirs(
-#     ${CMAKE_CURRENT_SOURCE_DIR}/RT_in_One_Weekend
-# )
+subdirs(
+    ${CMAKE_CURRENT_SOURCE_DIR}/Demo
+)
 
-# HelloCookieKissEngine programe
+# HelloCookieKissEngine programe ----------------------------------
 # find_package(glm CONFIG REQUIRED)
 # find_package(imgui CONFIG REQUIRED)
 add_executable(HelloCookieKissEngine HelloCookieKissEngine.cpp)

@@ -12,15 +12,17 @@ else()
 	message("current platform: unkonw ")
 endif()
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 project(CookieKiss-Engine
     VERSION 0.1.0
     DESCRIPTION "CookieKiss Engine"
     HOMEPAGE_URL "https://github.com/NWPU66/CookieKiss-Engine"
-    LANGUAGES CXX CUDA)
+    LANGUAGES CXX)
 
 # add subdirectory
-# subdirs(${CMAKE_CURRENT_SOURCE_DIR}/3rdparty)
+set(3rdparty ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty)
+# set(BASE_DIRECTORY ${3rdparty})
+subdirs(3rdparty)
 subdirs(${CMAKE_CURRENT_SOURCE_DIR}/Src)
 
 # install path
