@@ -1,9 +1,9 @@
 /**
  * @file main.cpp
  * @author your name (you@domain.com)
- * @brief VulkanMiniPatchTracer
+ * @brief
  * @version 0.1
- * @date 2024-11-04
+ * @date 2024-11-20
  *
  * @copyright Copyright (c) 2024
  *
@@ -20,7 +20,6 @@
 #include <memory>
 #include <string>
 #include <vector>
-#include <vulkan/vulkan_core.h>
 
 // 3rdparty
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -126,28 +125,32 @@ private:
     {
         // create vulkan context
         std::cout << "Creating Vulkan Context" << std::endl;
-        {
-            nvvk::ContextCreateInfo info;
-            info.apiMajor = 1;
-            info.apiMinor = 3;
 
-            // add extensions
-            VkPhysicalDeviceAccelerationStructureFeaturesKHR asFeatures{
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
-            };
-            VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
-            };
-            info.addDeviceExtension(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
-            info.addDeviceExtension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME, false,
-                                    &asFeatures);
-            info.addDeviceExtension(VK_KHR_RAY_QUERY_EXTENSION_NAME, false, &rayQueryFeatures);
-            info.addDeviceExtension(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME, true);  // TODO -
+        nvvk::ContextCreateInfo info;
+        info.setVersion(1, 3);
 
-            // create context and allocator
-            m_context.init(&info);
-            m_allocator.init(m_context.m_device, m_context.m_physicalDevice);
-        }
+        // add extensions
+        VkPhysicalDeviceAccelerationStructureFeaturesKHR asFeatures{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
+        };
+        VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
+        };
+        info.addDeviceExtension(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+        info.addDeviceExtension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME, false, &asFeatures);
+        info.addDeviceExtension(VK_KHR_RAY_QUERY_EXTENSION_NAME, false, &rayQueryFeatures);
+
+        // create context and allocator
+        m_context.init(info);
+        /**FIXME - &info好像不行，要改成info
+        const ContextCreateInfo& info = &info
+        &info被评估为“true”，相当于用true创建一个ContextCreateInfo
+        正好有适合的构造函数，它的bUseValidation = true。
+        ContextCreateInfo(bool bUseValidation = true);
+
+        隐式转化这种东西还挺麻烦的。。。。。。
+         */
+        m_allocator.init(m_context, m_context.m_physicalDevice);
     }
 
     void Prepocess()
@@ -303,6 +306,7 @@ private:
         }
 
         // Write values into the descriptor set.
+        std::cout << "Write values into the descriptor set." << std::endl;
         {
             std::array<VkWriteDescriptorSet, 4> writeDescriptorSets{};
 
@@ -333,7 +337,7 @@ private:
                 .buffer = m_indexBuffer.buffer,
                 .range  = VK_WHOLE_SIZE,
             };
-            writeDescriptorSets[2] =
+            writeDescriptorSets[3] =
                 m_descriptorSetContainer.makeWrite(0, 3, &vertexDescriptorBufferInfo);
 
             vkUpdateDescriptorSets(m_context.m_device,
@@ -342,6 +346,7 @@ private:
         }
 
         // shader and pipline
+        std::cout << "Creating pipeline" << std::endl;
         {
             // shader
             m_rayTraceModule = nvvk::createShaderModule(
