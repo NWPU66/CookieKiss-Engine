@@ -189,6 +189,10 @@ private:
             {
                 m_scene.indices->push_back(index.vertex_index);
             }
+
+            // print info
+            std::cout << "Mesh has " << m_scene.vertices->size() / 3 << " vertices" << std::endl;
+            std::cout << "Mesh has " << m_scene.indices->size() / 3 << " triangles" << std::endl;
         }
 
         // create command pool
@@ -236,7 +240,7 @@ private:
                 .maxVertex     = static_cast<uint32_t>(m_scene.vertices->size() / 3 - 1),
                 .indexType     = VK_INDEX_TYPE_UINT32,
                 .indexData     = {.deviceAddress = indexBufferAddress},
-                .transformData = {.deviceAddress = 0},  // No transform};
+                .transformData = {.deviceAddress = 0},  // No transform
             };
             // Create a VkAccelerationStructureGeometryKHR object that says it handles opaque
             // triangles and points to the above:
@@ -284,7 +288,7 @@ private:
         // create descriptor set
         std::cout << "Creating descriptor set" << std::endl;
         {
-            // Here's the list of bindings for the descriptor set layout, from raytrace.comp.glsl:
+            // Here's the list of bindings for the descriptor set layout, from raytrace.comp.glsl :
             // 0 - a storage buffer (the buffer `buffer`)
             // 1 - an acceleration structure (the TLAS)
             // 2 - a storage buffer (the vertex buffer)
@@ -351,7 +355,7 @@ private:
             // shader
             m_rayTraceModule = nvvk::createShaderModule(
                 m_context.m_device,
-                nvh::loadFile("shaders/raytrace.comp.glsl.spv", true, {asset_folder}));
+                nvh::loadFile("Shaders/raytrace.comp.glsl.spv", true, {asset_folder}));
             VkPipelineShaderStageCreateInfo shaderStageCreateInfo{
                 .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                 .stage  = VK_SHADER_STAGE_COMPUTE_BIT,
@@ -372,6 +376,8 @@ private:
 
     void Rendering()
     {
+        std::cout << "Start to Rendering" << std::endl;
+
         auto cmdBuffer = AllocateAndBeginOneTimeCommandBuffer(m_context.m_device, m_cmdPool);
 
         vkCmdBindPipeline(cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_computePipeline);
@@ -379,6 +385,11 @@ private:
         vkCmdBindDescriptorSets(cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 m_descriptorSetContainer.getPipeLayout(), 0, 1, &descriptorSet, 0,
                                 nullptr);
+        /**NOTE - binding point 和 descriptor set
+        Pipeline可以绑定多个descriptor set，在shader中使用set设置要访问的set
+        每个set中的描述符自己设置绑定点，在shader中通过layout(binding = x)设置要访问的描述符
+         */
+
         // Run the compute shader with enough workgroups to cover the entire buffer:
         // 类似CUDA的线程块
         vkCmdDispatch(cmdBuffer, (uint32_t(render_width) + workgroup_width - 1) / workgroup_width,
@@ -399,8 +410,19 @@ private:
 
     void Postprocess()
     {
+        std::cout << "Postprocess: Save Image" << std::endl;
+
         // Get the image data back from the GPU
         void* data = m_allocator.map(m_buffer);
+        // read the data from the pointer
+        for (int i = 0; i < 10; i++)
+        {
+            for (int j = 0; j < 3; j++)
+            {
+                std::cout << reinterpret_cast<float*>(data)[i * 3 + j] << " ";
+            }
+            std::cout << std::endl;
+        }
         stbi_write_hdr(output_file.c_str(), render_width, render_height, 3,
                        reinterpret_cast<float*>(data));
         m_allocator.unmap(m_buffer);
@@ -408,6 +430,8 @@ private:
 
     void Cleanup()
     {
+        std::cout << "Cleanup" << std::endl;
+
         vkDestroyPipeline(m_context.m_device, m_computePipeline, nullptr);
         vkDestroyShaderModule(m_context.m_device, m_rayTraceModule, nullptr);
         m_descriptorSetContainer.deinit();
@@ -423,11 +447,12 @@ private:
 
 int main(int argc, char** argv)
 {
-    std::cout << "Hello VulkanMiniPatchTracer!" << std::endl;
     try
     {
+        std::cout << "Hello VulkanMiniPatchTracer!" << std::endl;
         auto app = std::make_unique<MiniPatchTracer>(argc, argv);
         app->Run();
+        std::cout << "Done !" << std::endl;
     }
     catch (std::exception& e)
     {
