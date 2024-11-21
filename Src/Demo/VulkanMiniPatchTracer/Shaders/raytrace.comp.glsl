@@ -159,6 +159,7 @@
 #version 460
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_ray_query : require
+#extension GL_EXT_debug_printf : require
 
 layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
 
@@ -267,7 +268,7 @@ void main()
   // v
   // y
   const uvec2 pixel = gl_GlobalInvocationID.xy;
-
+  debugPrintfEXT("pixel: %d, %d\n", int(pixel.x), int(pixel.y));
   // If the pixel is outside of the image, don't do anything:
   if((pixel.x >= resolution.x) || (pixel.y >= resolution.y))
   {
@@ -380,3 +381,6 @@ void main()
   uint linearIndex       = resolution.x * pixel.y + pixel.x;
   imageData[linearIndex] = summedPixelColor / float(NUM_SAMPLES);  // Take the average
 }
+
+//TODO - 在cpp中配置这个VK_VALIDATION_FEATURE_ENABLE_DEBUG_PRINTF_EXT
+//可以在shader中使用printf输出调试信息

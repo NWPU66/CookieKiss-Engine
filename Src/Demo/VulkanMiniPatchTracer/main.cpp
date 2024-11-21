@@ -1,14 +1,3 @@
-/**
- * @file main.cpp
- * @author your name (you@domain.com)
- * @brief
- * @version 0.1
- * @date 2024-11-20
- *
- * @copyright Copyright (c) 2024
- *
- */
-
 // c
 #include <cstdint>
 #include <cstdlib>
@@ -322,7 +311,7 @@ private:
             writeDescriptorSets[0] = m_descriptorSetContainer.makeWrite(
                 0 /*set index*/, 0 /*binding*/, &descriptorBufferInfo);
             // 1
-            auto tlasCopy = m_raytracingBuilder.getAccelerationStructure();
+            auto* tlasCopy = m_raytracingBuilder.getAccelerationStructure();
             VkWriteDescriptorSetAccelerationStructureKHR descriptorAS{
                 .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR,
                 .accelerationStructureCount = 1,
@@ -342,7 +331,7 @@ private:
                 .range  = VK_WHOLE_SIZE,
             };
             writeDescriptorSets[3] =
-                m_descriptorSetContainer.makeWrite(0, 3, &vertexDescriptorBufferInfo);
+                m_descriptorSetContainer.makeWrite(0, 3, &indexDescriptorBufferInfo);
 
             vkUpdateDescriptorSets(m_context.m_device,
                                    static_cast<uint32_t>(writeDescriptorSets.size()),
@@ -392,8 +381,10 @@ private:
 
         // Run the compute shader with enough workgroups to cover the entire buffer:
         // 类似CUDA的线程块
-        vkCmdDispatch(cmdBuffer, (uint32_t(render_width) + workgroup_width - 1) / workgroup_width,
-                      (uint32_t(render_height) + workgroup_height - 1) / workgroup_height, 1);
+        vkCmdDispatch(
+            cmdBuffer,
+            (static_cast<uint32_t>(render_width) + workgroup_width - 1) / workgroup_width,
+            (static_cast<uint32_t>(render_height) + workgroup_height - 1) / workgroup_height, 1);
         // 内存屏障
         VkMemoryBarrier memoryBarrier{
             .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -432,14 +423,25 @@ private:
     {
         std::cout << "Cleanup" << std::endl;
 
+        // 销毁管线和着色器模块
         vkDestroyPipeline(m_context.m_device, m_computePipeline, nullptr);
         vkDestroyShaderModule(m_context.m_device, m_rayTraceModule, nullptr);
+
+        // 销毁描述符集
         m_descriptorSetContainer.deinit();
+
+        // 销毁加速结构
         m_raytracingBuilder.destroy();
+
+        // 销毁缓冲区
         m_allocator.destroy(m_vertexBuffer);
         m_allocator.destroy(m_indexBuffer);
         m_allocator.destroy(m_buffer);
+
+        // 销毁命令池
         vkDestroyCommandPool(m_context, m_cmdPool, nullptr);
+
+        // 清理分配器和上下文
         m_allocator.deinit();
         m_context.deinit();
     }
