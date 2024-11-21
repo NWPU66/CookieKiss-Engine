@@ -1,3 +1,10 @@
 [submodule "3rdparty/nvpro_core"]
 	path = 3rdparty/nvpro_core
 	url = https://github.com/nvpro-samples/nvpro_core.git
+[submodule "3rdparty/heightmap_rtx"]
+	path = 3rdparty/heightmap_rtx
+	url = git@github.com:NVIDIAGameWorks/heightmap_rtx.git
+[submodule "3rdparty/imgui"]
+	path = 3rdparty/imgui
+	url = git@github.com:ocornut/imgui.git
+	branch = docking
