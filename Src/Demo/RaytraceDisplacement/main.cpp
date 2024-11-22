@@ -1,4 +1,17 @@
+/**
+ * @file main.cpp
+ * @author your name (you@domain.com)
+ * @brief
+ * @version 0.1
+ * @date 2024-11-22
+ *
+ * @copyright Copyright (c) 2024
+ *
+ */
+
 // c
+#include "nvh/cameramanipulator.hpp"
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -8,39 +21,54 @@
 #include <chrono>
 #include <exception>
 #include <functional>
+#include <glm/matrix.hpp>
 #include <iostream>
 #include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vulkan/vulkan_beta.h>
 
 // 3rdparty
 #define VK_ENABLE_BETA_EXTENSIONS
+#define VMA_IMPLEMENTATION
 #include "heightmap_rtx/include/heightmap_rtx.h"
 #include "imgui/backends/imgui_impl_vulkan.h"
 #include "imgui/imgui_camera_widget.h"
 #include "imgui/imgui_helper.h"
+#include "vma/include/vk_mem_alloc.h"
 #include <glm/vec4.hpp>
 #include <vulkan/vulkan_core.h>
 
 // 3rdparty - nvvk
+#include "nvh/primitives.hpp"
 #include "nvvk/buffers_vk.hpp"
+#include "nvvk/commands_vk.hpp"
 #include "nvvk/context_vk.hpp"
+#include "nvvk/debug_util_vk.hpp"
 #include "nvvk/descriptorsets_vk.hpp"
 #include "nvvk/resourceallocator_vk.hpp"
+#include "nvvk/sbtwrapper_vk.hpp"
 #include "nvvk/shaders_vk.hpp"
 
 // 3rdparty - nvvkhl
-#define PROJECT_NAME "RaytraceDisplacement"
+#include "nvvkhl/alloc_vma.hpp"
 #include "nvvkhl/application.hpp"
 #include "nvvkhl/element_camera.hpp"
 #include "nvvkhl/element_gui.hpp"
 #include "nvvkhl/element_testing.hpp"
+#include "nvvkhl/gbuffer.hpp"
+#include "nvvkhl/pipeline_container.hpp"
+#include "nvvkhl/shaders/dh_sky.h"
 
 // users
+#include "Shaders/device_host.h"
+#include "raytracing_vk.hpp"
 
 // global variables
+constexpr std::string_view PROJECT_NAME = "RaytraceDisplacement";
+#define HEIGHTMAP_RESOLUTION 256
 
 /**
  * @brief 计时器
@@ -48,8 +76,11 @@
  */
 class Timer {
 public:
-    Timer() { init(""); }
-    explicit Timer(std::string message) { init(std::move(message)); }
+    Timer() : Timer("") {}
+    explicit Timer(std::string message)
+        : m_message(std::move(message)), m_startTime(std::chrono::system_clock::now())
+    {
+    }
 
     ~Timer()
     {
@@ -62,12 +93,6 @@ public:
 private:
     std::string                                        m_message;
     std::chrono::time_point<std::chrono::system_clock> m_startTime;
-
-    void init(std::string message)
-    {
-        m_message   = std::move(message);
-        m_startTime = std::chrono::system_clock::now();
-    }
 };
 
 /**
@@ -161,7 +186,28 @@ private:
 struct AnimatedHeightmap
 {
 public:
+    void create(nvvkhl::AllocVma& alloc, nvvk::DebugUtil& dutil, uint32_t resolution) {}  // TODO -
+
+    void destroy() {}  // TODO -
+
+    void clear(VkCommandBuffer cmd) {}  // TODO -
+
+    void animate(VkCommandBuffer cmd) {}  // TODO -
+
+    void height() {}  // TODO -
+
+    void velocity() {}  // TODO -
+
+    void setMouse() {}  // TODO -
+
 private:
+    void imageLayouts() {}  // TODO -
+
+    void imageBarrier() {}  // TODO -
+
+    void createHeightmaps() {}  // TODO -
+
+    void destroyHeightmaps() {}  // TODO -
 };
 
 class RaytracingSample : public nvvkhl::IAppElement {
@@ -169,15 +215,173 @@ public:
     RaytracingSample()           = default;
     ~RaytracingSample() override = default;
 
-    void onAttach(nvvkhl::Application* app) override {}  // TODO -
+    void onAttach(nvvkhl::Application* app) override
+    {
+        m_app    = app;
+        m_device = app->getDevice();
 
-    void onDetach() override {}  // TODO -
+        VmaAllocatorCreateInfo allocator_info{
+            .flags          = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
+            .physicalDevice = app->getPhysicalDevice(),
+            .device         = app->getDevice(),
+            .instance       = app->getInstance(),
+        };
 
-    void onResize(uint32_t width, uint32_t height) override {}  // TODO -
+        m_dutil = std::make_unique<nvvk::DebugUtil>(m_device);         // Debug utility
+        m_alloc = std::make_unique<nvvkhl::AllocVma>(allocator_info);  // Allocator
+        m_staticCommandPool =
+            std::make_unique<nvvk::CommandPool>(m_device, m_app->getQueue(0).queueIndex);
+        m_rtContext       = rt::Context{m_device, m_alloc.get(), nullptr,
+                                  [](VkResult result) { NVVK_CHECK(result); }};
+        m_rtScratchBuffer = std::make_unique<rt::ScratchBuffer>(m_rtContext);
 
-    void onUIRender() override {}  // TODO -
+        m_rtSet.init(m_device);
 
-    void onRender(VkCommandBuffer cmd) override {}  // TODO -
+        // Requesting ray tracing properties
+        VkPhysicalDeviceProperties2 prop2{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+            .pNext = &m_rtProperties,
+        };
+        vkGetPhysicalDeviceProperties2(m_app->getPhysicalDevice(), &prop2);
+
+        // Create resources
+        createScene();
+        createVkBuffers();
+        createHrtxPipeline();
+        static_assert(HEIGHTMAP_RESOLUTION % ANIMATION_WORKGROUP_SIZE == 0,
+                      "currently, resolution must match compute workgroup size");
+        m_heightmap.create(*m_alloc, *m_dutil, HEIGHTMAP_RESOLUTION);
+        const VkDescriptorImageInfo& heightmapHeightDesc =
+            m_heightmap.height().descriptor;  // same for both buffers A/B
+        m_heightmapImguiDesc =
+            ImGui_ImplVulkan_AddTexture(heightmapHeightDesc.sampler, heightmapHeightDesc.imageView,
+                                        heightmapHeightDesc.imageLayout);
+        // ANCHOR - ???
+
+        // Initialize the heightmap textures before referencing one in
+        // createHrtxMap().
+        {
+            auto* cmd = m_app->createTempCmdBuffer();
+            m_heightmap.clear(cmd);
+            m_app->submitAndWaitTempCmdBuffer(cmd);
+        }
+
+        {
+            VkCommandBuffer cmd = m_app->createTempCmdBuffer();
+            createBottomLevelAS(cmd);
+            createTopLevelAS(cmd);
+            m_app->submitAndWaitTempCmdBuffer(cmd);
+        }
+
+        createRtxPipeline();
+        createGbuffers(m_viewSize);
+    }
+
+    void onDetach() override { destroyResources(); }
+
+    void onResize(uint32_t width, uint32_t height) override
+    {
+        createGbuffers(glm::vec2{width, height});
+        writeRtDesc();
+    }
+
+    void onUIRender() override  // TODO -
+    {
+        // Setting menu
+        {
+        }
+
+        // Rendering Viewport
+        {
+        }
+
+        // Heightmap preview and mouse interaction
+        {
+        }
+    }
+
+    void onRender(VkCommandBuffer cmd) override
+    {
+        if (m_settings.enableAnimation)
+        {
+            // 在提交 m_cmdHrtxUpdate 之前推进高度图动画。注意
+            // animate() 被调用两次，以便将双缓冲的结果返回到原始状态。理想情况下，这里只需要调用
+            // submitTempCmdBuffer()， 以避免在渲染循环中出现 GPU 停顿，但该函数尚未实现。
+            VkCommandBuffer animCmd = m_app->createTempCmdBuffer();
+            m_heightmap.animate(animCmd);
+            m_heightmap.animate(animCmd);
+            m_app->submitAndWaitTempCmdBuffer(animCmd);
+
+            // Update the raytracing displacement from the heightmap. m_cmdHrtxUpdate
+            // already includes an image barrier for compute shader writes.
+            VkSubmitInfo submit = {
+                .sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                .commandBufferCount = 1,
+                .pCommandBuffers    = &m_cmdHrtxUpdate,
+            };
+            vkQueueSubmit(m_app->getQueue(0).queue, 1, &submit, VK_NULL_HANDLE);
+
+            // 为高度图重建 BLAS。然后需要更新 TLAS，
+            // 但不需要更新其他静态几何体。请注意，上述动画和
+            // heightmap_rtx 命令在 onRender() 返回之前在同一队列上提交，
+            // 并且临时的 'cmd' 也被提交，因此事件的顺序仍然被保留。
+            m_rtBlas[0].update(m_rtContext, m_rtBlasInput[0], *m_rtScratchBuffer, cmd);
+
+            // 对于 TLAS，使用 PREFER_FAST_TRACE 标志，并仅执行重建，
+            m_rtTlas->rebuild(m_rtContext, m_rtTlasInput, *m_rtScratchBuffer, cmd);
+
+            // NOTE - 为什么blas是更新而tlas是重建？
+        }
+
+        auto sdbg = m_dutil->DBG_SCOPE(cmd);
+
+        // 摄像机操作
+        float     view_aspect_ratio = m_viewSize.x / m_viewSize.y;
+        glm::vec3 eye;
+        glm::vec3 center;
+        glm::vec3 up;
+        CameraManip.getLookat(eye, center, up);
+        // Update the uniform buffer containing frame info
+        const auto& clip = CameraManip.getClipPlanes();
+        auto proj_mat = glm::perspectiveRH_ZO(glm::radians(CameraManip.getFov()), view_aspect_ratio,
+                                              clip.x, clip.y);
+        proj_mat[1][1] *= -1;  // flip y axis
+        auto               view_mat = CameraManip.getMatrix();
+        shaders::FrameInfo finfo{
+            .proj    = proj_mat,
+            .view    = view_mat,
+            .projInv = glm::inverse(proj_mat),
+            .viewInv = glm::inverse(view_mat),
+            .camPos  = eye,
+        };
+        vkCmdUpdateBuffer(cmd, m_bFrameInfo.buffer, 0, sizeof(shaders::FrameInfo), &finfo);
+
+        // Update the sky
+        vkCmdUpdateBuffer(cmd, m_bSkyParams.buffer, 0, sizeof(nvvkhl_shaders::SimpleSkyParameters),
+                          &m_skyParams);
+
+        // Ray trace
+        std::vector<VkDescriptorSet> desc_sets{m_rtSet.getSet()};
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtPipe.plines[0]);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtPipe.layout, 0,
+                                static_cast<uint32_t>(desc_sets.size()), desc_sets.data(), 0,
+                                nullptr);
+
+        m_pushConst.opacity         = m_settings.opacity;
+        m_pushConst.refractiveIndex = m_settings.refractiveIndex;
+        m_pushConst.density         = m_settings.density;
+        m_pushConst.heightmapScale  = m_settings.heightmapScale;
+        m_pushConst.maxDepth        = m_settings.maxDepth;
+        m_pushConst.wireframeScale  = 1 << m_settings.subdivlevel;
+        vkCmdPushConstants(cmd, m_rtPipe.layout, VK_SHADER_STAGE_ALL, 0,
+                           sizeof(shaders::PushConstant), &m_pushConst);
+        // NOTE - 设置少量的管线运行时常量
+
+        const auto& regions = m_sbt.getRegions();
+        const auto& size    = m_app->getViewportSize();
+        vkCmdTraceRaysKHR(cmd, &regions[0], &regions[1], &regions[2], &regions[3], size.width,
+                          size.height, 1);
+    }
 
 private:
     struct settings  // ANCHOR - 渲染器的设置
@@ -194,9 +398,63 @@ private:
 
     struct PrimitiveMeshVk
     {
-        nvvk::Buffer vertices;
-        nvvk::Buffer indices;
+        nvvk::Buffer vertices, indices;
     };
+
+    // vulkan应用与实例
+    nvvkhl::Application*               m_app{nullptr};
+    std::unique_ptr<nvvk::DebugUtil>   m_dutil;
+    nvvkhl::AllocVma                   m_alloc;
+    std::unique_ptr<nvvk::CommandPool> m_staticCommandPool;
+
+    // 基本渲染设置
+    glm::vec2 m_viewSize    = {1, 1};
+    VkFormat  m_colorFormat = VK_FORMAT_R8G8B8A8_UNORM;       // Color format of the image
+    VkFormat  m_depthFormat = VK_FORMAT_X8_D24_UNORM_PACK32;  // Depth format of the depth buffer
+    VkClearColorValue m_clearColor = {.float32 = {0.3F, 0.3F, 0.3F, 1.0F}};  // Clear color
+    VkDevice          m_device     = VK_NULL_HANDLE;                         // Convenient
+    std::unique_ptr<nvvkhl::GBuffer>    m_gBuffer;  // G-Buffers: color + depth
+    nvvkhl_shaders::SimpleSkyParameters m_skyParams{};
+
+    // GPU scene buffers
+    std::vector<PrimitiveMeshVk> m_bMeshes;
+    nvvk::Buffer                 m_bFrameInfo, m_bSkyParams;
+
+    // Data and settings
+    std::vector<nvh::PrimitiveMesh> m_meshes;
+    std::vector<nvh::Node>          m_nodes;
+
+    // Raytracing pipeline
+    nvvk::DescriptorSetContainer m_rtSet;                  // Descriptor set
+    shaders::PushConstant        m_pushConst{};            // Information sent to the shader
+    VkPipelineLayout m_pipelineLayout   = VK_NULL_HANDLE;  // The description of the pipeline
+    VkPipeline       m_graphicsPipeline = VK_NULL_HANDLE;  // The graphic pipeline to render
+    int              m_frame            = 0;
+
+    // ray tracing
+    VkPhysicalDeviceRayTracingPipelinePropertiesKHR m_rtProperties{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR,
+    };
+    ShaderModule                                           m_rtShaderRgen;
+    ShaderModule                                           m_rtShaderRmiss;
+    ShaderModule                                           m_rtShaderRchit;
+    nvvk::SBTWrapper                                       m_sbt;  // Shader binding table wrapper
+    rt::Context                                            m_rtContext;
+    std::unique_ptr<rt::ScratchBuffer>                     m_rtScratchBuffer;
+    VkAccelerationStructureTrianglesDisplacementMicromapNV m_rtDisplacement;
+    std::vector<rt::AccelerationStructureInput>            m_rtBlasInput;
+    std::vector<rt::BuiltAccelerationStructure>            m_rtBlas;
+    std::unique_ptr<rt::InstanceBuffer>                    m_rtInstances;
+    rt::AccelerationStructureInput                         m_rtTlasInput;
+    std::unique_ptr<rt::BuiltAccelerationStructure>        m_rtTlas;
+    nvvkhl::PipelineContainer                              m_rtPipe;
+
+    // height map
+    HrtxPipeline      m_hrtxPipeline{};
+    HrtxMap           m_hrtxMap{};
+    AnimatedHeightmap m_heightmap;
+    VkDescriptorSet   m_heightmapImguiDesc = VK_NULL_HANDLE;
+    VkCommandBuffer   m_cmdHrtxUpdate      = VK_NULL_HANDLE;
 
     void createScene() {}  // TODO -
 
@@ -355,6 +613,7 @@ int main(int argc, char** argv)
         app->run();
         vkDeviceWaitIdle(app->getDevice());
         app.reset();
+
         return test->errorCode();
     }
     catch (std::exception& e)
@@ -363,3 +622,14 @@ int main(int argc, char** argv)
         return EXIT_FAILURE;
     }
 }
+
+/**
+ * FIXME - 记录编译问题
+ * 有三个未解析的外部符号：
+ * 1. ImGui::DockBuilderSplitNode(unsigned int, int, float, unsigned int*, unsigned int*)
+ *    仅vcpkg版本包含此函数签名。在编译main.cpp.obj时，请使用nvpro版本的头文件。
+ * 2. ImGui::GetForegroundDrawList(void)
+ *    仅vcpkg版本包含此函数签名。在编译implot.cpp.obj时，请使用nvpro版本的头文件。
+ * 3. ImGui::ArrowButtonEx(const char*, int, struct ImVec2, int)
+ *    问题大概率与上述相同。
+ */

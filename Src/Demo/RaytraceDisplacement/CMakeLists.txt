@@ -24,6 +24,7 @@ target_include_directories(${DEMO_NAME} PUBLIC
     # ${VCPKG_INCLUDE_DIR}
     ${3rdparty}/nvpro_core
     ${3rdparty}/nvpro_core/third_party/implot
+    ${3rdparty}/nvpro_core/third_party
     ${3rdparty}/nvpro_core/nvp
     ${3rdparty}
     )
