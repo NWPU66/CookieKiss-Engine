@@ -11,6 +11,7 @@
 
 // c
 #include <cassert>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -23,6 +24,7 @@
 #include <functional>
 #include <glm/matrix.hpp>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -77,31 +79,6 @@
 // global variables
 constexpr std::string_view PROJECT_NAME = "RaytraceDisplacement";
 #define HEIGHTMAP_RESOLUTION 256
-
-/**
- * @brief 计时器
- *
- */
-class Timer {
-public:
-    Timer() : Timer("") {}
-    explicit Timer(std::string message)
-        : m_message(std::move(message)), m_startTime(std::chrono::system_clock::now())
-    {
-    }
-
-    ~Timer()
-    {
-        auto endTime = std::chrono::system_clock::now();
-        auto duration =
-            std::chrono::duration_cast<std::chrono::milliseconds>(endTime - m_startTime);
-        std::cout << "Timer(): " << m_message << " Time:  " << duration.count() / 1000.0f << " s\n";
-    }
-
-private:
-    std::string                                        m_message;
-    std::chrono::time_point<std::chrono::system_clock> m_startTime;
-};
 
 /**
  * @brief Move-only VkShaderModule constructed from SPIR-V data
@@ -234,9 +211,28 @@ public:
         vkCreateComputePipelines(device, {}, 1, &computePipelineCreate, nullptr, &pipeline);
     }
 
-    void dispatch() {}  // TODO -
+    void dispatch(VkCommandBuffer     cmd,
+                  const PushConstants pushConstants,
+                  uint32_t            groupCountX,
+                  uint32_t            groupCountY = 1,
+                  uint32_t            groupCountZ = 1)
+    {
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1,
+                                &descriptorSet, 0, nullptr);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        vkCmdPushConstants(cmd, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                           sizeof(PushConstants), &pushConstants);
+        vkCmdDispatch(cmd, groupCountX, groupCountY, groupCountZ);
+    }
 
-    void destroy() {}  // TODO -
+    void destroy(VkDevice device)
+    {
+        vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
+        vkDestroyDescriptorPool(device, descriptorPool, nullptr);
+        vkDestroyPipeline(device, pipeline, nullptr);
+        vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+        shaderModule = ShaderModule();
+    }
 
 private:
     VkDescriptorSet       descriptorSet{VK_NULL_HANDLE};
@@ -255,22 +251,112 @@ public:
         m_resolution = resolution;
         createHeightmaps(alloc, dutil);
 
-        m_animatePipeline.create();
-
-        // TODO -
+        SingleComputePipeline<shaders::AnimatePushConstants>::BindingsCB bindingsCallback{
+            .declare = [](nvvk::DescriptorSetBindings& bindings) -> void {
+                bindings.addBinding(BINDING_ANIM_IMAGE_A_HEIGHT, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                    1, VK_SHADER_STAGE_COMPUTE_BIT);
+                bindings.addBinding(BINDING_ANIM_IMAGE_B_HEIGHT, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                    1, VK_SHADER_STAGE_COMPUTE_BIT);
+                bindings.addBinding(BINDING_ANIM_IMAGE_A_VELOCITY, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                    1, VK_SHADER_STAGE_COMPUTE_BIT);
+                bindings.addBinding(BINDING_ANIM_IMAGE_B_VELOCITY, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                    1, VK_SHADER_STAGE_COMPUTE_BIT);
+            },
+            .create = [this](nvvk::DescriptorSetBindings& bindings,
+                             VkDescriptorSet descriptorSet) -> std::vector<VkWriteDescriptorSet> {
+                return std::vector<VkWriteDescriptorSet>{
+                    bindings.makeWrite(descriptorSet, BINDING_ANIM_IMAGE_A_HEIGHT,
+                                       &(this->m_heightmapA.descriptor)),
+                    bindings.makeWrite(descriptorSet, BINDING_ANIM_IMAGE_B_HEIGHT,
+                                       &(this->m_heightmapB.descriptor)),
+                    bindings.makeWrite(descriptorSet, BINDING_ANIM_IMAGE_A_VELOCITY,
+                                       &(this->m_velocityA.descriptor)),
+                    bindings.makeWrite(descriptorSet, BINDING_ANIM_IMAGE_B_VELOCITY,
+                                       &(this->m_velocityB.descriptor)),
+                };
+            },
+        };
+        m_animatePipeline.create(alloc.getDevice(), bindingsCallback,
+                                 ShaderModule(alloc.getDevice(), animate_heightmap_comp));
     }
 
-    void destroy() {}  // TODO -
+    void destroy(nvvkhl::AllocVma& alloc)
+    {
+        destroyHeightmaps(alloc);
+        m_animatePipeline.destroy(alloc.getDevice());
+    }
 
-    void clear(VkCommandBuffer cmd) {}  // TODO -
+    void clear(VkCommandBuffer cmd)
+    {
+        VkClearColorValue       heightValue{.float32 = {0.5f}};
+        VkClearColorValue       velocityValue{.float32 = {0.0f}};
+        VkImageSubresourceRange range{
+            .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel   = 0,
+            .levelCount     = 1,
+            .baseArrayLayer = 0,
+            .layerCount     = 1,
+        };
 
-    void animate(VkCommandBuffer cmd) {}  // TODO -
+        // Perform the initial transition from VK_IMAGE_LAYOUT_UNDEFINED
+        imageBarrier(cmd, VK_IMAGE_LAYOUT_GENERAL);
+        m_currentIsA = !m_currentIsA;
+        imageBarrier(cmd, VK_IMAGE_LAYOUT_GENERAL);
 
-    void height() {}  // TODO -
+        vkCmdClearColorImage(cmd, height().image, height().descriptor.imageLayout, &heightValue, 1,
+                             &range);
+        vkCmdClearColorImage(cmd, velocity().image, velocity().descriptor.imageLayout,
+                             &velocityValue, 1, &range);
+        imageBarrier(cmd, VK_IMAGE_LAYOUT_GENERAL);
+        m_currentIsA = !m_currentIsA;
+    }
 
-    void velocity() {}  // TODO -
+    void animate(VkCommandBuffer cmd)
+    {
+        shaders::AnimatePushConstants pushConstants{
+            .mouse      = m_mouse * glm::vec2(m_resolution),
+            .writeToA   = m_currentIsA ? 0U : 1U,
+            .resolution = int(m_resolution),
+            .deltaTime  = 1.0F,
+        };
 
-    void setMouse() {}  // TODO -
+        // Add some raindrops if the user doesn't draw for a few seconds
+        const double timeout      = 5.0;
+        const double dropDelay    = 0.5;
+        const double dropDuration = 0.05;
+        auto         now          = std::chrono::system_clock::now();
+        static auto  lastDraw     = std::chrono::system_clock::time_point();
+        if (m_mouse.x >= 0.0f) { lastDraw = now; }
+        if (std::chrono::duration<double>(now - lastDraw).count() > timeout)
+        {
+            static std::random_device                    rd;
+            static std::mt19937                          mt(rd());
+            static std::uniform_real_distribution<float> dist(0.0, double(m_resolution));
+            static auto                                  lastDrop = now;
+            static glm::vec2                             dropPos  = {};
+            if (std::chrono::duration<double>(now - lastDrop).count() > dropDelay)
+            {
+                lastDrop = now;
+                dropPos  = {dist(mt), dist(mt)};
+            }
+            if (std::chrono::duration<double>(now - lastDrop).count() < dropDuration)
+            {
+                pushConstants.mouse = dropPos;
+            }
+        }
+
+        assert(m_resolution % ANIMATION_WORKGROUP_SIZE == 0);
+        m_animatePipeline.dispatch(cmd, pushConstants, m_resolution / ANIMATION_WORKGROUP_SIZE,
+                                   m_resolution / ANIMATION_WORKGROUP_SIZE);
+
+        imageBarrier(cmd, VK_IMAGE_LAYOUT_GENERAL);
+
+        m_currentIsA = !m_currentIsA;
+    }
+
+    const nvvk::Texture& height() const { return m_currentIsA ? m_heightmapB : m_heightmapA; }
+    const nvvk::Texture& velocity() const { return m_currentIsA ? m_velocityB : m_velocityA; }
+    void                 setMouse(const glm::vec2& position) { m_mouse = position; }
 
 private:
     SingleComputePipeline<shaders::AnimatePushConstants> m_animatePipeline;
@@ -285,13 +371,90 @@ private:
     VkImageLayout m_currentImageLayoutsA = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout m_currentImageLayoutsB = VK_IMAGE_LAYOUT_UNDEFINED;
 
-    void imageLayouts() {}  // TODO -
+    VkImageLayout& imageLayouts()
+    {
+        return m_currentIsA ? m_currentImageLayoutsB : m_currentImageLayoutsA;
+    }
 
-    void imageBarrier() {}  // TODO -
+    void imageBarrier(VkCommandBuffer cmd, VkImageLayout newLayout)
+    {
+        std::array<VkImageMemoryBarrier, 2> barriers{
+            nvvk::makeImageMemoryBarrier(height().image, VK_ACCESS_SHADER_WRITE_BIT,
+                                         VK_ACCESS_SHADER_READ_BIT, imageLayouts(), newLayout),
+            nvvk::makeImageMemoryBarrier(velocity().image, VK_ACCESS_SHADER_WRITE_BIT,
+                                         VK_ACCESS_SHADER_READ_BIT, imageLayouts(), newLayout),
+        };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             0, 0, nullptr, 0, nullptr, barriers.size(), barriers.data());
+        imageLayouts() = newLayout;
+    }
 
-    void createHeightmaps() {}  // TODO -
+    void createHeightmaps(nvvkhl::AllocVma& alloc, nvvk::DebugUtil& dutil)
+    {
+        VkImageCreateInfo imageInfo = nvvk::makeImage2DCreateInfo(
+            VkExtent2D{m_resolution, m_resolution}, VkFormat{VK_FORMAT_R32_SFLOAT},
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT);
+        nvvk::Image imageA = alloc.createImage(imageInfo);
+        nvvk::Image imageB = alloc.createImage(imageInfo);
+        nvvk::Image imageC = alloc.createImage(imageInfo);
+        nvvk::Image imageD = alloc.createImage(imageInfo);
 
-    void destroyHeightmaps() {}  // TODO -
+        VkSamplerCreateInfo samplerInfo{
+            .sType                   = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+            .pNext                   = nullptr,
+            .flags                   = 0,
+            .magFilter               = VK_FILTER_LINEAR,
+            .minFilter               = VK_FILTER_LINEAR,
+            .mipmapMode              = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+            .addressModeU            = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+            .addressModeV            = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+            .addressModeW            = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+            .mipLodBias              = 0,
+            .anisotropyEnable        = false,
+            .maxAnisotropy           = 0,
+            .compareEnable           = false,
+            .compareOp               = VK_COMPARE_OP_NEVER,
+            .minLod                  = 0,
+            .maxLod                  = std::numeric_limits<float>::max(),
+            .borderColor             = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
+            .unnormalizedCoordinates = VK_FALSE,
+        };
+        m_heightmapA = alloc.createTexture(
+            imageA, nvvk::makeImage2DViewCreateInfo(imageA.image, VK_FORMAT_R32_SFLOAT),
+            samplerInfo);
+        m_heightmapB = alloc.createTexture(
+            imageB, nvvk::makeImage2DViewCreateInfo(imageB.image, VK_FORMAT_R32_SFLOAT),
+            samplerInfo);
+        m_velocityA = alloc.createTexture(
+            imageC, nvvk::makeImage2DViewCreateInfo(imageC.image, VK_FORMAT_R32_SFLOAT),
+            samplerInfo);
+        m_velocityB = alloc.createTexture(
+            imageD, nvvk::makeImage2DViewCreateInfo(imageD.image, VK_FORMAT_R32_SFLOAT),
+            samplerInfo);
+        dutil.setObjectName(m_heightmapA.descriptor.imageView, "HeightmapA");
+        dutil.setObjectName(m_heightmapB.descriptor.imageView, "HeightmapB");
+        dutil.setObjectName(m_velocityA.descriptor.imageView, "VelocityA");
+        dutil.setObjectName(m_velocityB.descriptor.imageView, "VelocityB");
+
+        // 图像布局可能会随着时间的推移而变化。尽管如此，nvvk::Texture
+        // 在持久的描述符中保持一个布局，但这并不总是保持最新。 nvvk::ResourceAllocator 默认为
+        // VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL， 但由于我们知道将过渡到
+        // VK_IMAGE_LAYOUT_GENERAL， 因此在创建管道描述符集布局之前进行了设置。
+        m_heightmapA.descriptor.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        m_heightmapB.descriptor.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        m_velocityA.descriptor.imageLayout  = VK_IMAGE_LAYOUT_GENERAL;
+        m_velocityB.descriptor.imageLayout  = VK_IMAGE_LAYOUT_GENERAL;
+    }
+
+    void destroyHeightmaps(nvvkhl::AllocVma& alloc)
+    {
+        alloc.destroy(m_heightmapA);
+        alloc.destroy(m_heightmapB);
+        alloc.destroy(m_velocityA);
+        alloc.destroy(m_velocityB);
+    }
 };
 
 class RaytracingSample : public nvvkhl::IAppElement {
@@ -1305,4 +1468,13 @@ int main(int argc, char** argv)
  *    仅vcpkg版本包含此函数签名。在编译implot.cpp.obj时，请使用nvpro版本的头文件。
  * 3. ImGui::ArrowButtonEx(const char*, int, struct ImVec2, int)
  *    问题大概率与上述相同。
+ */
+
+/**NOTE - glsl编译成c风格的头文件cmd
+ E:\VulkanSDK\1.3.280.0\Bin\glslangValidator.exe
+ -g
+ --target-env vulkan1.3
+ --vn pathtrace_rgen
+ -o .\spirv\generated_spirv\pathtrace_rgen.h
+ .\pathtrace.rgen
  */
