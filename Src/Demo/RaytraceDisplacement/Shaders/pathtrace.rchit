@@ -107,5 +107,105 @@ void main()
     {
         return;
     }
-}
-
+    
+    // NOTE - 对于非微网格三角形，可能无法访问 gl_HitMicroTriangleVertexPositionsNV 或
+    // gl_HitMicroTriangleVertexBarycentricsNV。
+    bool isMicromesh=gl_HitKindEXT==gl_HitKindFrontFacingMicroTriangleNV||gl_HitKindEXT==gl_HitKindBackFacingMicroTriangleNV;
+    bool isFront=gl_HitKindEXT==gl_HitKindFrontFacingTriangleEXT||gl_HitKindEXT==gl_HitKindFrontFacingMicroTriangleNV;
+    
+    vec3 wPos=gl_WorldRayOriginEXT+gl_WorldRayDirectionEXT*gl_HitTEXT;
+    //NOTE - gl_HitTEXT是gl_RayTmaxEXT的别名，会在运行的过程中改变
+    //其中，在closest hit shader中，gl_HitTEXT是最近击中点相对于射线原点的距离
+    vec3 wDir=normalize(gl_WorldRayDirectionEXT);
+    vec3 wEye=-wDir;
+    vec3 wLight=normalize(skyInfo.directionToLight);
+    vec3 wNorm=isMicromesh?
+    normalize(cross(gl_HitMicroTriangleVertexPositionsNV[2]-gl_HitMicroTriangleVertexPositionsNV[0],
+        gl_HitMicroTriangleVertexPositionsNV[2]-gl_HitMicroTriangleVertexPositionsNV[1])):
+        normalize(cross(gl_HitTriangleVertexPositionsEXT[2]-gl_HitTriangleVertexPositionsEXT[0],
+            gl_HitTriangleVertexPositionsEXT[2]-gl_HitTriangleVertexPositionsEXT[1]));
+            
+            float height=(wPos.y/pc.heightmapScale)*2.f+.5f;
+            
+            wNorm=isFront?wNorm:-wNorm;
+            
+            vec3 albedo=vec3(.2,.2,.8);
+            
+            // Add wireframe
+            float opacity=pc.opacity;
+            if(isMicromesh){
+                // Color based on the height
+                albedo=temperature(height);
+                
+                float wire=1.;
+                const vec2 microBary2=baseToMicro(gl_HitMicroTriangleVertexBarycentricsNV,attribs);
+                const vec3 microBary=vec3(1.F-microBary2.x-microBary2.y,microBary2.xy);
+                wireframe(wire,.002F*pc.wireframeScale,microBary);//小三角形的线绘制
+                
+                const vec3 baseBary=vec3(1.-attribs.x-attribs.y,attribs.xy);
+                wireframe(wire,.008F,baseBary);//大三角形的线绘制
+                
+                const vec3 wireColor=vec3(.3F,.3F,.3F);
+                albedo=mix(wireColor,albedo,wire);
+                opacity=mix(1.,opacity,wire);
+            }
+            
+            float ior=isFront?(1./pc.refractiveIndex):pc.refractiveIndex;
+            float reflectivity=fresnelSchlickApprox(wDir,wNorm,ior);
+            vec3 reflectionWeight=payload.weight*reflectivity;
+            vec3 refractionWeight=payload.weight*(1.-reflectivity);
+            int newDepth=payload.depth+1;
+            
+            if(isFront){
+                // Add light contribution unless in shadow
+                bool visible=shadowRay(wPos,wLight);
+                if(visible){
+                    float diffuse=clamp(dot(wNorm,wLight),0.,1.);
+                    payload.color+=payload.weight*albedo*diffuse*opacity;
+                }
+                //NOTE - 正面接收来自天光的漫反射（直接漫反射）
+            }else{
+                // Absorption - Beer's law
+                vec3 density=vec3(.8,.8,.4);
+                vec3 absorption=exp(-density*pc.density*gl_HitTEXT);
+                //NOTE - 背面代表几何体的内部，是参与介质（半透明材质），会吸收光线
+                reflectionWeight*=absorption;
+                refractionWeight*=absorption;
+            }
+            refractionWeight*=(1.-opacity);
+            
+            // Note: the following follows both sides of the branch, which is slow
+            
+            // Reflection
+            if(max(max(reflectionWeight.x,reflectionWeight.y),reflectionWeight.z)>.01){
+                //NOTE - 任何一个色彩分量的反射权重 > 0，则进行反射
+                vec3 reflectDir=reflect(wDir,wNorm);
+                payload.weight=reflectionWeight;
+                payload.depth=newDepth;
+                traceRayEXT(topLevelAS,gl_RayFlagsCullBackFacingTrianglesEXT,0xFF,0,0,0,wPos,.0001,reflectDir,100.,0);
+            }
+            
+            // Refraction
+            if(max(max(refractionWeight.x,refractionWeight.y),refractionWeight.z)>.01){
+                //NOTE - 任何一个色彩分量的折射权重 > 0，则进行折射
+                vec3 refractDir=refract(wDir,wNorm,ior);
+                payload.weight=refractionWeight;
+                payload.depth=newDepth;
+                traceRayEXT(topLevelAS,gl_RayFlagsCullBackFacingTrianglesEXT,0xFF,0,0,0,wPos,.0001,refractDir,100.,0);
+            }
+            
+        }
+        
+        /**NOTE - 材质总结
+        1. payload是一个共享存储区（对于每个像素而言，1spp），光线追踪traceRayEXT()是递归进行的，不存在对共享存储区的数据竞争
+        
+        2. payload.color是这个像素的最终颜色，是所有光线贡献的累加
+        3. payload.weight是当前光线对最终颜色的贡献，payload.depth是当前光线递归的深度
+        
+        4. 主要材质：表面是漫反射，内部是有色玻璃
+        5. 正面击中时，接收来自天光的漫反射，背面击中时，接收来自玻璃内部的散射（参与介质）
+        
+        6. 下一层射线由反射和折射构成。设置好权重和深度后，调用traceRayEXT()进入下一层射线
+        7. 随着程序遍历所有光线的分支路径（路径追踪），payload.color会逐渐积累所有当前光线的颜色
+        */
+        

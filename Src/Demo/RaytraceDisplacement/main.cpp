@@ -1050,6 +1050,8 @@ private:
         // build updates, so the object is stored in m_rtDisplacement.
         m_rtBlasInput[0].geometries[0].geometry.triangles.pNext =
             m_settings.enableDisplacement ? &m_rtDisplacement : nullptr;
+        // NOTE -
+        // 这个地方把高度图加入到BLAS的创建中去，closestHitShader会返回microMap中小三角形的击中信息
 
         // Create the bottom level acceleration structures
         m_rtBlas.clear();
