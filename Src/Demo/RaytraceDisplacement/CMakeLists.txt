@@ -24,6 +24,7 @@ target_include_directories(${DEMO_NAME} PUBLIC
     # ${VCPKG_INCLUDE_DIR}
     ${3rdparty}/nvpro_core
     ${3rdparty}/nvpro_core/third_party/implot
+    ${3rdparty}/nvpro_core/third_party/vma/include
     ${3rdparty}/nvpro_core/third_party
     ${3rdparty}/nvpro_core/nvp
     ${3rdparty}
@@ -32,6 +33,7 @@ target_include_directories(${DEMO_NAME} PUBLIC
 # linking
 target_link_libraries(${DEMO_NAME} PRIVATE
     ${3rdparty}/nvpro_core_lib/nvpro_core_gl_vk_shaderc.lib
+    ${3rdparty}/heightmap_rtx_lib/heightmap_rtx.lib
     Vulkan::Vulkan
     # imgui::imgui
     # implot::implot

@@ -39,7 +39,7 @@ void main()
     const uint rayFlags=gl_RayFlagsCullBackFacingTrianglesEXT;
     const float tMin=.001;
     const float tMax=INFINITE;
-    
+
     traceRayEXT(topLevelAS,// acceleration structure
         rayFlags,// rayFlags
         0xFF,// cullMask

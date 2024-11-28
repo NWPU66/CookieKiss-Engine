@@ -31,18 +31,18 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include <vulkan/vulkan_beta.h>
+
+constexpr std::string_view PROJECT_NAME = "RaytraceDisplacement";
 
 // 3rdparty
 #define VK_ENABLE_BETA_EXTENSIONS
 #define VMA_IMPLEMENTATION
 #include "heightmap_rtx/include/heightmap_rtx.h"
 #include "imgui/backends/imgui_impl_vulkan.h"
-#include "imgui/imgui.h"
 #include "imgui/imgui_camera_widget.h"
 #include "imgui/imgui_helper.h"
-#include "vma/include/vk_mem_alloc.h"
 #include <glm/vec4.hpp>
+#include <vulkan/vulkan_beta.h>
 #include <vulkan/vulkan_core.h>
 
 // 3rdparty - nvvk
@@ -74,10 +74,13 @@
 #include "Shaders/animate_heightmap.h"
 #include "Shaders/device_host.h"
 #include "Shaders/dh_bindings.h"
+#include "Shaders/spirv/generated_spirv/animate_heightmap_comp.h"
+#include "Shaders/spirv/generated_spirv/pathtrace_rchit.h"
+#include "Shaders/spirv/generated_spirv/pathtrace_rgen.h"
+#include "Shaders/spirv/generated_spirv/pathtrace_rmiss.h"
 #include "raytracing_vk.hpp"
 
 // global variables
-constexpr std::string_view PROJECT_NAME = "RaytraceDisplacement";
 #define HEIGHTMAP_RESOLUTION 256
 
 /**
@@ -91,9 +94,8 @@ public:
 
     // 模板构造函数，使用SPIR-V数据创建VkShaderModule
     template <size_t N>
-    ShaderModule(VkDevice device, const std::array<uint32_t, N>& spirv)
-        : m_device(device),
-          m_module(nvvk::createShaderModule(device, spirv.data(), spirv.size() * sizeof(uint32_t)))
+    ShaderModule(VkDevice device, const uint32_t (&spirv)[N])
+        : m_device(device), m_module(nvvk::createShaderModule(device, spirv, N * sizeof(uint32_t)))
     {
     }
 
@@ -756,7 +758,7 @@ private:
     // vulkan应用与实例
     nvvkhl::Application*               m_app{nullptr};
     std::unique_ptr<nvvk::DebugUtil>   m_dutil;
-    nvvkhl::AllocVma                   m_alloc;
+    std::unique_ptr<nvvkhl::AllocVma>  m_alloc;
     std::unique_ptr<nvvk::CommandPool> m_staticCommandPool;
 
     // 基本渲染设置
@@ -915,8 +917,7 @@ private:
                 alloc->destroy(*nvvkBuffer);
                 delete nvvkBuffer;
             },
-            .userPtr         = nullptr,
-            .systemAllocator = m_alloc.get(),
+            .userPtr = m_alloc.get(),
         };
 
         // Create a HrtxPipeline object. This holds the shader and resources for baking
@@ -1130,13 +1131,18 @@ private:
 
         // Creating all shaders
         enum StageIndices { eRaygen, eMiss, eClosestHit, eShaderGroupCount };
-        std::array<VkPipelineShaderStageCreateInfo, 3> stages{
+        std::array<ShaderModule, eShaderGroupCount> shaderModules{
+            ShaderModule(m_device, pathtrace_rgen),
+            ShaderModule(m_device, pathtrace_rmiss),
+            ShaderModule(m_device, pathtrace_rchit),
+        };
+        std::array<VkPipelineShaderStageCreateInfo, eShaderGroupCount> stages{
             VkPipelineShaderStageCreateInfo{
                 .sType               = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                 .pNext               = nullptr,
                 .flags               = 0,
                 .stage               = VK_SHADER_STAGE_RAYGEN_BIT_KHR,
-                .module              = ShaderModule(),
+                .module              = VkShaderModule(shaderModules[eRaygen]),
                 .pName               = "main",
                 .pSpecializationInfo = nullptr,
             },  // RAYGEN
@@ -1145,7 +1151,7 @@ private:
                 .pNext               = nullptr,
                 .flags               = 0,
                 .stage               = VK_SHADER_STAGE_MISS_BIT_KHR,
-                .module              = ShaderModule(),
+                .module              = VkShaderModule(shaderModules[eMiss]),
                 .pName               = "main",
                 .pSpecializationInfo = nullptr,
             },  // MISS
@@ -1154,7 +1160,7 @@ private:
                 .pNext               = nullptr,
                 .flags               = 0,
                 .stage               = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR,
-                .module              = ShaderModule(),
+                .module              = VkShaderModule(shaderModules[eClosestHit]),
                 .pName               = "main",
                 .pSpecializationInfo = nullptr,
             },  // CLOSEST_HIT
