@@ -8,3 +8,6 @@
 	path = 3rdparty/imgui
 	url = git@github.com:ocornut/imgui.git
 	branch = docking
+[submodule "3rdparty/Streamline"]
+	path = 3rdparty/Streamline
+	url = git@github.com:NVIDIAGameWorks/Streamline.git
