@@ -23,6 +23,7 @@
 #include "Streamline/include/sl_dlss.h"
 #include "Streamline/include/sl_dlss_g.h"
 #include "Streamline/include/sl_helpers_vk.h"
+#include "Streamline/include/sl_pcl.h"
 #include "Streamline/include/sl_reflex.h"
 
 // users

@@ -16,7 +16,7 @@ add_executable(${DEMO_NAME}
     ${SRC}
     # ${IMGUI_SRC}
     # ${IMPLOT_SRC}
-    # ${3rdparty}/nvpro_core/third_party/imgui/backends/imgui_impl_vulkan.cpp
+    ${3rdparty}/nvpro_core/third_party/imgui/backends/imgui_impl_glfw.cpp
     )
 
 # includes
@@ -25,6 +25,7 @@ target_include_directories(${DEMO_NAME} PRIVATE
     ${3rdparty}/nvpro_core
     ${3rdparty}/nvpro_core/nvp
     ${3rdparty}/nvpro_core/third_party
+    ${3rdparty}/nvpro_core/third_party/imgui
     ${3rdparty}/nvpro_core/third_party/vma/include
     ${3rdparty}
     )

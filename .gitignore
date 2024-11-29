@@ -41,6 +41,7 @@
 
 # build folder
 build/
+cmake-build-debug/
 x64/
 
 # clangd config

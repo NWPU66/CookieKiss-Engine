@@ -24,12 +24,15 @@
 // 3rdparty
 #define GLFW_INCLUDE_VULKAN
 #include "GLFW/glfw3.h"
+#include "backends/imgui_impl_glfw.h"
 #include "glm/glm.hpp"
 #include <vulkan/vulkan_core.h>
 
 static const std::string PROJECT_NAME = "StreamlineDLSS";
 
 // 3rdparty - nvvk
+#define VMA_IMPLEMENTATION
+#include "nvh/cameramanipulator.hpp"
 #include "nvh/primitives.hpp"
 #include "nvvk/context_vk.hpp"
 #include "nvvk/descriptorsets_vk.hpp"
@@ -43,6 +46,7 @@ static const std::string PROJECT_NAME = "StreamlineDLSS";
 #define SL_MANUAL_HOOKING true
 #include "streamline_wrapper.hpp"
 // NOTE - streamline_wrapper负责动态加载sl的函数，main.cpp不需要再include sl的头文件
+#include "Shaders/common.h"
 
 // global variables
 static const int SAMPLE_WIDTH  = 1920;
@@ -54,22 +58,101 @@ static const sl::Feature SL_FEATURES[] = {
     sl::kFeatureDLSS_G,  // DLSS Frame Generation
 };
 
+static const VkFormat SAMPLE_DEPTH_FORMAT =
+    VK_FORMAT_D24_UNORM_S8_UINT;  // Streamline only supports VK_FORMAT_D24_UNORM_S8_UINT and
+                                  // VK_FORMAT_D32_SFLOAT currently
+static const VkFormat SAMPLE_COLOR_FORMATS[] = {
+    VK_FORMAT_R16G16B16A16_SFLOAT,  // Color
+    VK_FORMAT_R16G16_SFLOAT         // Motion vectors (must be in format VK_FORMAT_R16G16_SFLOAT or
+                                    // VK_FORMAT_R32G32_SFLOAT)
+};
+
+#define USE_D3D_CLIP_SPACE 0
+
 class StreamlineSample : public nvvkhl::AppBaseVk {
 public:
     StreamlineSample()           = default;
     ~StreamlineSample() override = default;
 
-    void create();  // TODO -
+    void create(const nvvkhl::AppBaseVkCreateInfo& info,
+                sl::Result                         dlssSupported,
+                sl::Result                         dlssgSupported)
+    {
+        AppBaseVk::create(info);
 
-    void destroy() override;  // TODO -
+        m_dlssSupported  = dlssSupported;
+        m_dlssgSupported = dlssgSupported;
 
-    void onResize(int width, int height) override;  // TODO -
+        // This sample only operates with a single viewport, so create a handle for viewport index
+        // zero
+        m_viewportHandle = sl::ViewportHandle(0);
 
-    void prepareFrame() override;  // TODO -
+        // Limit to 180 FPS by default
+        m_reflexOptions.frameLimitUs = 5555;
 
-    void renderFrame();  // TODO -
+        // This sample does simulation and rendering in a single thread, so can't use markers to
+        // optimize
+        m_reflexOptions.useMarkersToOptimize = false;
 
-    void drawGui();  // TODO -
+        // Set Streamline default options
+        slDLSSSetOptions(m_viewportHandle, m_dlssOptions);
+        slDLSSGSetOptions(m_viewportHandle, m_dlssgOptions);
+        slReflexSetOptions(m_reflexOptions);
+
+        m_dset  = std::make_unique<nvvk::DescriptorSetContainer>(info.device);
+        m_alloc = std::make_unique<nvvk::ResourceAllocatorVma>(info.instance, info.device,
+                                                               info.physicalDevice);
+
+        createScene();
+        createPipelines();
+        createImages(getSize());  // FIXME - getSize()这个函数找不到
+    }
+
+    void destroy() override
+    {
+        vkDeviceWaitIdle(m_device);
+
+        destroyImages();
+        destroyPipelines();
+        destroyScene();
+
+        m_alloc->releaseSampler(m_defaultSampler);
+        m_defaultSampler = VK_NULL_HANDLE;
+
+        m_dset.reset();
+        m_alloc.reset();
+
+        AppBaseVk::destroy();
+    }
+
+    void onResize(int width, int height) override
+    {
+        createImages(VkExtent2D{static_cast<uint32_t>(width), static_cast<uint32_t>(height)});
+    }
+
+    void prepareFrame() override
+    {
+        AppBaseVk::prepareFrame();
+
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+        drawGui();
+        ImGui::Render();
+        // REVIEW - 这里为什么突然用到imgui，整个流程中没有看到imgui的初始化
+
+        m_animationTimePrev = m_animationTime;
+        m_animationTime += ImGui::GetIO().DeltaTime;
+    }
+
+    void renderFrame(VkCommandBuffer cmd, sl::FrameToken* frame)
+    {
+        // TODO -
+    }
+
+    void drawGui()
+    {
+        // TODO -
+    }
 
 private:
     sl::Result m_dlssSupported  = sl::Result::eOk;
@@ -114,17 +197,74 @@ private:
     glm::mat4 m_projMatrixPrev;
     glm::mat4 m_viewMatrixPrev;
 
-    void createScene();  // TODO -
+    void createScene()
+    {
+        // Create meshes
+        m_sceneMeshes.emplace_back(nvh::createSphereUv());
+        m_sceneMeshes.emplace_back(nvh::createCube());
+        m_sceneMeshes.emplace_back(nvh::createTetrahedron());
+        m_sceneMeshes.emplace_back(nvh::createOctahedron());
+        m_sceneMeshes.emplace_back(nvh::createIcosahedron());
+        m_sceneMeshes.emplace_back(nvh::createConeMesh());
+        const int num_meshes = static_cast<int>(m_sceneMeshes.size());
 
-    void createPipelines();  // TODO -
+        const VkCommandBuffer cmd = createTempCmdBuffer();
+        for (int i = 0; i < num_meshes; i++)
+        {
+            PrimitiveMeshVk& mesh = m_sceneMeshes[i];
+            mesh.verticesBuffer =
+                m_alloc->createBuffer(cmd, mesh.vertices, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+            mesh.trianglesBuffer =
+                m_alloc->createBuffer(cmd, mesh.triangles, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+        }
+        m_frameInfo = m_alloc->createBuffer(sizeof(FrameInfo), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        submitTempCmdBuffer(cmd);
 
-    void createImages();  // TODO -
+        // Create instances/nodes
+        for (int i = 0; i < num_meshes; i++)
+        {
+            Node& node       = m_sceneNodes.emplace_back();
+            node.mesh        = i;
+            node.material    = i;
+            node.translation = glm::vec3(
+                -(static_cast<float>(num_meshes) * 0.5f) + static_cast<float>(i), 0.0f, 0.0f);
+            node.motion = true;
+        }
+        Node& background       = m_sceneNodes.emplace_back();
+        background.mesh        = 1;
+        background.translation = {0.0f, 0.0f, -5.0f};
+        background.scale       = {50, 50, 50};
 
-    void destroyScene();  // TODO -
+        CameraManip.setClipPlanes({0.1f, 100.0f});
+        CameraManip.setLookat({0.0f, 0.0f, 5.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f});
+    }
 
-    void destroyPipelines();  // TODO -
+    void createPipelines()
+    {
+        // TODO -
+    }
 
-    void destroyImages();  // TODO -
+    void createImages(const VkExtent2D& size)
+    {
+        // TODO -
+    }
+
+    void destroyScene()
+    {
+        // TODO -
+    }
+
+    void destroyPipelines()
+    {
+        // TODO -
+    }
+
+    void destroyImages()
+    {
+        // TODO -
+    }
 };
 
 /**
@@ -339,7 +479,7 @@ void assignVulkanInfoToStreamline(nvvk::Context& context)
  * @brief Create Window Surface
  *
  */
-VkSurfaceKHR createWindowSurface(nvvk::ContextCreateInfo& context, GLFWwindow* window)
+VkSurfaceKHR createWindowSurface(nvvk::Context& context, GLFWwindow* window)
 {
     VkSurfaceKHR surface = VK_NULL_HANDLE;
 
@@ -423,7 +563,7 @@ int main(int argc, char** argv)
         assignVulkanInfoToStreamline(context);
 
         // Create window surface
-        VkSurfaceKHR surface = createWindowSurface(contextInfo, window);
+        VkSurfaceKHR surface = createWindowSurface(context, window);
 
         // Create main application
         nvvkhl::AppBaseVkCreateInfo appInfo{
@@ -441,10 +581,79 @@ int main(int argc, char** argv)
         app.create(appInfo, dlssSupported, dlssgSupported);
 
         // Main loop
-        // TODO -
+        while (glfwWindowShouldClose(window) == 0)
+        {
+            if (app.isMinimized())
+            {
+                glfwPollEvents();
+                continue;
+            }
+
+            sl::FrameToken* frame = nullptr;
+            if (SL_FAILED(res, slGetNewFrameToken(frame)))
+            {
+                LOGE("Streamline: Failed to get new frame token (%d)\n", res);
+                break;
+            }
+
+            // Perform sleep before any input is processed for optimal frame pacing
+            slReflexSleep(*frame);
+
+            // Input
+            {
+                // 模拟标记应该捕捉读取新的输入和所有基于这些输入更新世界所做的工作，但不包括上面的休眠
+                slPCLSetMarker(sl::PCLMarker::eSimulationStart, *frame);
+
+                glfwPollEvents();
+                app.prepareFrame();
+
+                slPCLSetMarker(sl::PCLMarker::eSimulationEnd, *frame);
+                // NOTE - sl::ReflexMarker has change to sl::PCLMarker
+                // and slReflexSetMarker has been changed to slPCLSetMarker
+            }
+
+            // Rendering
+            {
+                const uint32_t        curFrame = app.getCurFrame();
+                const VkCommandBuffer cmd      = app.getCommandBuffers()[curFrame];
+
+                slPCLSetMarker(sl::PCLMarker::eRenderSubmitStart, *frame);
+
+                VkCommandBufferBeginInfo beginInfo = {
+                    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+                };
+                vkBeginCommandBuffer(cmd, &beginInfo);
+                app.renderFrame(cmd, frame);
+                vkEndCommandBuffer(cmd);
+
+                slPCLSetMarker(sl::PCLMarker::eRenderSubmitEnd, *frame);
+            }
+
+            // Presentation
+            {
+                // This marker is required for DLSS-G to work
+                slPCLSetMarker(sl::PCLMarker::ePresentStart, *frame);
+
+                app.submitFrame();
+
+                slPCLSetMarker(sl::PCLMarker::ePresentEnd, *frame);
+            }
+        }
 
         // clean up
-        // TODO -
+        app.destroy();
+
+        // 在销毁 Vulkan 设备之前关闭 Streamline，以便它能正确清理资源
+        slShutdown();
+
+        vkDestroySurfaceKHR(context.m_instance, surface, nullptr);
+
+        context.deinit();
+
+        glfwDestroyWindow(window);
+
+        glfwTerminate();
     }
     catch (std::exception& e)
     {
@@ -454,3 +663,8 @@ int main(int argc, char** argv)
 
     return EXIT_SUCCESS;
 }
+
+/**NOTE - Nvidia Reflex技术
+主要解决系统延迟的问题(游戏延迟分为三部分:网络延迟和系统延迟)
+通过Reflex技术降低系统延迟
+ */
