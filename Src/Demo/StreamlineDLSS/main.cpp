@@ -10,12 +10,16 @@
  */
 
 // c
+#include "imgui.h"
+#include "nvvk/images_vk.hpp"
 #include <cstdint>
 #include <cstdlib>
 
 // cpp
+#include <algorithm>
 #include <exception>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -37,6 +41,7 @@ static const std::string PROJECT_NAME = "StreamlineDLSS";
 #include "nvvk/context_vk.hpp"
 #include "nvvk/descriptorsets_vk.hpp"
 #include "nvvk/memallocator_vma_vk.hpp"
+#include "nvvk/pipeline_vk.hpp"
 
 // 3rdparty - nvvkhl
 #include "nvvkhl/appbase_vk.hpp"
@@ -103,9 +108,12 @@ public:
         m_alloc = std::make_unique<nvvk::ResourceAllocatorVma>(info.instance, info.device,
                                                                info.physicalDevice);
 
+        const VkSamplerCreateInfo samplerCreateInfo = nvvk::makeSamplerCreateInfo();
+        m_defaultSampler                            = m_alloc->acquireSampler(samplerCreateInfo);
+
         createScene();
         createPipelines();
-        createImages(getSize());  // FIXME - getSize()这个函数找不到
+        createImages(getSize());
     }
 
     void destroy() override
@@ -125,6 +133,12 @@ public:
         AppBaseVk::destroy();
     }
 
+    /**
+     * @brief onResize
+     *
+     * @note 交换链的重建由父类onFramebufferSize负责
+     * onFramebufferSize函数内会调用虚函数onResize，它基本上是onFramebufferSize的后处理函数
+     */
     void onResize(int width, int height) override
     {
         createImages(VkExtent2D{static_cast<uint32_t>(width), static_cast<uint32_t>(height)});
@@ -139,6 +153,7 @@ public:
         drawGui();
         ImGui::Render();
         // REVIEW - 这里为什么突然用到imgui，整个流程中没有看到imgui的初始化
+        // 有没有可能父类nvvkhl::AppBaseVk已经初始化过了。
 
         m_animationTimePrev = m_animationTime;
         m_animationTime += ImGui::GetIO().DeltaTime;
@@ -151,7 +166,135 @@ public:
 
     void drawGui()
     {
-        // TODO -
+        ImGui::SetNextWindowSize(ImVec2(200, 500), ImGuiCond_FirstUseEver);
+        ImGui::Begin("Settings");
+
+        // The framerate calculated by the application does not account for the additional present
+        // calls introduced by DLSS Frame Generation, so need to adjust it accordingly
+        uint32_t numFramesActuallyPresented = 1;
+        if (m_dlssgSupported == sl::Result::eOk)
+        {
+            sl::DLSSGState dlssgState;
+            if (SL_FAILED(res, slDLSSGGetState(m_viewportHandle, dlssgState,
+                                               &m_dlssgOptions)))  // Only call this once per frame!
+            {
+                LOGE("Streamline: Failed to get DLSS Frame Generation state (%d)\n", res);
+            }
+            else if (dlssgState.status != sl::DLSSGStatus::eOk)
+            {
+                LOGE("Streamline: DLSS Frame Generation status is %u\n", dlssgState.status);
+
+                // Turn off DLSS Frame Generation if something went wrong
+                m_dlssgOptions.mode = sl::DLSSGMode::eOff;
+                slDLSSGSetOptions(m_viewportHandle, m_dlssgOptions);
+            }
+            numFramesActuallyPresented = max(dlssgState.numFramesActuallyPresented, 1U);
+        }
+        ImGui::Text("FPS: %f\n",
+                    static_cast<double>(ImGui::GetIO().Framerate * numFramesActuallyPresented));
+        // NOTE - ImGui::GetIO().Framerate是标准的一帧，而DLSS技术能在一帧内生成多个额外帧
+
+        if (ImGui::CollapsingHeader("Reflex"))
+        {
+            ImGui::PushID("Reflex");
+
+            bool modified = false;
+
+            modified |= ImGui::Combo("Mode", reinterpret_cast<int*>(&m_reflexOptions.mode),
+                                     "Off\0Low Latency\0Low Latency with Boost\0");
+
+            if (int fps = m_reflexOptions.frameLimitUs != 0 ?
+                              static_cast<int>((1000.0f / m_reflexOptions.frameLimitUs) * 1000.0f) :
+                              0;
+                ImGui::InputInt("FPS Limit", &fps, 1, 100, ImGuiInputTextFlags_EnterReturnsTrue))
+            {
+                // Clamp possible FPS range
+                fps = std::clamp(fps, 1, 200);
+
+                m_reflexOptions.frameLimitUs = static_cast<uint32_t>((1000.0f / fps) * 1000.0f);
+                modified                     = true;
+            }
+
+            if (modified)
+            {
+                if (SL_FAILED(res, slReflexSetOptions(m_reflexOptions)))
+                {
+                    LOGE("Streamline: Failed to set Reflex options (%d)\n", res);
+                }
+            }
+
+            ImGui::PopID();
+        }
+
+        if (ImGui::CollapsingHeader("DLSS Super Resolution"))
+        {
+            ImGui::PushID("DLSS Super Resolution");
+
+            if (m_dlssSupported == sl::Result::eOk)
+            {
+                bool modified = false;
+
+                modified |= ImGui::Combo("Mode", reinterpret_cast<int*>(&m_dlssOptions.mode),
+                                         "Off\0Performance\0Balanced\0Quality\0Ultra "
+                                         "Performance\0Ultra Quality\0DLAA\0");
+                modified |= ImGui::SliderFloat("Sharpness", &m_dlssOptions.sharpness, 0.0f, 1.0f);
+
+                if (modified) { createImages(getSize()); }
+            }
+            else
+            {
+                ImGui::TextWrapped(
+                    "DLSS Super Resolution is not supported on this adapter (return code %d)",
+                    m_dlssSupported);
+            }
+
+            ImGui::PopID();
+        }
+
+        if (ImGui::CollapsingHeader("DLSS Frame Generation"))
+        {
+            ImGui::PushID("DLSS Frame Generation");
+
+            if (m_dlssgSupported == sl::Result::eOk)
+            {
+                bool modified = false;
+                modified |=
+                    ImGui::Checkbox("Enabled", reinterpret_cast<bool*>(&m_dlssgOptions.mode));
+
+                if (modified)
+                {
+                    // DLSS Frame Generation requires Reflex to be on
+                    if (m_dlssgOptions.mode != sl::DLSSGMode::eOff &&
+                        m_reflexOptions.mode == sl::ReflexMode::eOff)
+                    {
+                        m_reflexOptions.mode = sl::ReflexMode::eLowLatency;
+                        slReflexSetOptions(m_reflexOptions);
+                    }
+
+                    if (SL_FAILED(res, slDLSSGSetOptions(m_viewportHandle, m_dlssgOptions)))
+                    {
+                        LOGE("Streamline: Failed to set DLSS Frame Generation options (%d)\n", res);
+                    }
+                }
+            }
+            else if (m_dlssgSupported == sl::Result::eErrorOSDisabledHWS)
+            {
+                ImGui::TextWrapped("DLSS Frame Generation is not supported because "
+                                   "hardware-accelerated GPU scheduling is not enabled: "
+                                   "https://devblogs.microsoft.com/directx/"
+                                   "hardware-accelerated-gpu-scheduling/");
+            }
+            else
+            {
+                ImGui::TextWrapped(
+                    "DLSS Frame Generation is not supported on this adapter (return code %d)",
+                    m_dlssgSupported);
+            }
+
+            ImGui::PopID();
+        }
+
+        ImGui::End();
     }
 
 private:
@@ -183,7 +326,7 @@ private:
     };
     std::vector<Node> m_sceneNodes;
 
-    nvvk::Buffer m_frameInfo;
+    nvvk::Buffer m_frameInfo;  // Pipeline Push Content
 
     VkPipeline m_scenePipeline = VK_NULL_HANDLE;
     VkPipeline m_postPipeline  = VK_NULL_HANDLE;
@@ -243,27 +386,214 @@ private:
 
     void createPipelines()
     {
-        // TODO -
+        // init descriptor set
+        m_dset->addBinding(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
+        m_dset->addBinding(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
+        m_dset->initLayout();
+        m_dset->initPool(1);
+        const VkPushConstantRange pushConstantRange{
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            .offset     = 0,
+            .size       = sizeof(NodeInfo),
+        };
+        m_dset->initPipeLayout(1, &pushConstantRange);
+
+        // Update descriptor set
+        {
+            VkDescriptorBufferInfo frameInfoBufferInfo{
+                .buffer = m_frameInfo.buffer,
+                .offset = 0,
+                .range  = VK_WHOLE_SIZE,
+            };
+            VkWriteDescriptorSet frameInfoWrite = m_dset->makeWrite(0, 0, &frameInfoBufferInfo);
+            vkUpdateDescriptorSets(m_device, 1, &frameInfoWrite, 0, nullptr);
+        }
+
+        // Create the scene rendering pipeline
+        {
+            // pipelineState
+            nvvk::GraphicsPipelineState pipelineState{};
+            pipelineState.rasterizationState.cullMode = VK_CULL_MODE_NONE;
+            pipelineState.addBindingDescriptions({
+                VkVertexInputBindingDescription{
+                    .binding   = 0,
+                    .stride    = sizeof(nvh::PrimitiveVertex),
+                    .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+                },
+            });
+            pipelineState.addAttributeDescriptions({
+                VkVertexInputAttributeDescription{
+                    .location = 0,
+                    .binding  = 0,
+                    .format   = VK_FORMAT_R32G32B32_SFLOAT,
+                    .offset   = offsetof(nvh::PrimitiveVertex, p),
+                },
+                VkVertexInputAttributeDescription{
+                    .location = 0,
+                    .binding  = 0,
+                    .format   = VK_FORMAT_R32G32B32_SFLOAT,
+                    .offset   = offsetof(nvh::PrimitiveVertex, n),
+                },
+            });
+            pipelineState.clearBlendAttachmentStates();
+            for (uint32_t i = 0; i < std::size(SAMPLE_COLOR_FORMATS); i++)
+            {
+                pipelineState.addBlendAttachmentState(
+                    nvvk::GraphicsPipelineState::makePipelineColorBlendAttachmentState());
+                // 这里加入了两个ColorBlendAttachment
+            }
+
+            // renderingInfo
+            VkPipelineRenderingCreateInfo renderingInfo{
+                .sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+                .pNext                   = nullptr,
+                .colorAttachmentCount    = std::size(SAMPLE_COLOR_FORMATS),
+                .pColorAttachmentFormats = &SAMPLE_COLOR_FORMATS[0],
+                .depthAttachmentFormat   = SAMPLE_DEPTH_FORMAT,
+            };
+
+            nvvk::GraphicsPipelineGenerator pipelineGenerator(m_device, m_dset->getPipeLayout(),
+                                                              renderingInfo, pipelineState);
+            pipelineGenerator.addShader(
+                std::vector<uint32_t>{std::begin(scene_vert), std::end(scene_vert)},
+                VK_SHADER_STAGE_VERTEX_BIT);
+            pipelineGenerator.addShader(
+                std::vector<uint32_t>{std::begin(scene_frag), std::end(scene_frag)},
+                VK_SHADER_STAGE_FRAGMENT_BIT);
+
+            m_scenePipeline = pipelineGenerator.createPipeline();
+        }
+
+        // Create the post-processing pipeline
+        {
+            nvvk::GraphicsPipelineState pipelineState;
+
+            const VkFormat                colorFormat = m_swapChain.getFormat();
+            VkPipelineRenderingCreateInfo renderingInfo{
+                .sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+                .pNext                   = nullptr,
+                .colorAttachmentCount    = 1,
+                .pColorAttachmentFormats = &colorFormat,
+            };
+
+            nvvk::GraphicsPipelineGenerator pipelineGenerator(m_device, m_dset->getPipeLayout(),
+                                                              renderingInfo, pipelineState);
+            pipelineGenerator.addShader(
+                std::vector<uint32_t>{std::begin(post_vert), std::end(post_vert)},
+                VK_SHADER_STAGE_VERTEX_BIT);
+            pipelineGenerator.addShader(
+                std::vector<uint32_t>{std::begin(post_frag), std::end(post_frag)},
+                VK_SHADER_STAGE_FRAGMENT_BIT);
+
+            m_postPipeline = pipelineGenerator.createPipeline();
+        }
     }
 
     void createImages(const VkExtent2D& size)
     {
-        // TODO -
+        vkDeviceWaitIdle(m_device);
+
+        destroyImages();
+
+        // Update output dimensions for DLSS Super Resolution
+        m_dlssOptions.outputWidth  = size.width;
+        m_dlssOptions.outputHeight = size.height;
+        m_dlssOptions.colorBuffersHDR =
+            (SAMPLE_COLOR_FORMATS[0] >= VK_FORMAT_A2R10G10B10_UNORM_PACK32) ? sl::Boolean::eTrue :
+                                                                              sl::Boolean::eFalse;
+        if (SL_FAILED(res, slDLSSSetOptions(m_viewportHandle, m_dlssOptions)))
+        {
+            LOGE("Streamline: Failed to set DLSS Super Resolution options (%d)\n", res);
+        }
+
+        sl::DLSSOptimalSettings dlssSettings;
+        if (SL_FAILED(res, slDLSSGetOptimalSettings(m_dlssOptions, dlssSettings)) ||
+            m_dlssOptions.mode == sl::DLSSMode::eOff || dlssSettings.optimalRenderWidth == 0 ||
+            dlssSettings.optimalRenderHeight == 0)
+        {
+            // Default render dimensions to the window dimensions if DLSS is not enabled
+            dlssSettings.optimalRenderWidth  = size.width;
+            dlssSettings.optimalRenderHeight = size.height;
+        }
+
+        const VkExtent2D renderSize{dlssSettings.optimalRenderWidth,
+                                    dlssSettings.optimalRenderHeight};
+
+        m_gBuffers = std::make_unique<nvvkhl::GBuffer>(
+            m_device, m_alloc.get(), renderSize,
+            std::vector<VkFormat>(std::begin(SAMPLE_COLOR_FORMATS), std::end(SAMPLE_COLOR_FORMATS)),
+            SAMPLE_DEPTH_FORMAT);
+
+        if (m_dlssOptions.mode != sl::DLSSMode::eOff)
+        {
+            // The image DLSS Super Resolution outputs to must have the VK_IMAGE_USAGE_STORAGE_BIT
+            // usage flag, or else nothing will be rendered to it!
+            const VkImageCreateInfo outputCreateInfo = nvvk::makeImage2DCreateInfo(
+                renderSize, SAMPLE_COLOR_FORMATS[0],
+                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT);
+            m_outputImage = m_alloc->createImage(outputCreateInfo);
+
+            const VkImageViewCreateInfo outputViewCreateInfo =
+                nvvk::makeImage2DViewCreateInfo(m_outputImage.image, outputCreateInfo.format);
+            NVVK_CHECK(
+                vkCreateImageView(m_device, &outputViewCreateInfo, nullptr, &m_outputImageView));
+        }
+        else
+        {
+            m_outputImage.image = m_gBuffers->getColorImage();
+            m_outputImageView   = m_gBuffers->getColorImageView();
+        }
+
+        // Update descriptor set with the new output image
+        {
+            const VkDescriptorImageInfo outputImageInfo{
+                .sampler     = m_defaultSampler,
+                .imageView   = m_outputImageView,
+                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            };
+            const VkWriteDescriptorSet outputImageWrite = m_dset->makeWrite(0, 1, &outputImageInfo);
+            vkUpdateDescriptorSets(m_device, 1, &outputImageWrite, 0, nullptr);
+        }
     }
 
     void destroyScene()
     {
-        // TODO -
+        for (PrimitiveMeshVk& mesh : m_sceneMeshes)
+        {
+            m_alloc->destroy(mesh.trianglesBuffer);
+            m_alloc->destroy(mesh.verticesBuffer);
+        }
+
+        m_sceneNodes.clear();
+        m_sceneMeshes.clear();
+
+        m_alloc->destroy(m_frameInfo);
     }
 
     void destroyPipelines()
     {
-        // TODO -
+        vkDestroyPipeline(m_device, m_scenePipeline, nullptr);
+        m_scenePipeline = VK_NULL_HANDLE;
+
+        vkDestroyPipeline(m_device, m_postPipeline, nullptr);
+        m_postPipeline = VK_NULL_HANDLE;
     }
 
     void destroyImages()
     {
-        // TODO -
+        if (m_outputImage.memHandle != nullptr)
+        {
+            vkDestroyImageView(m_device, m_outputImageView, nullptr);
+            m_alloc->destroy(m_outputImage);
+            // NOTE - 两种情况
+            // 不拿GBuffer的时候，把自己创建的东西删掉
+            // 拿GBuffer的时候，reset GBuffer就好了
+        }
+        else { m_outputImage.image = VK_NULL_HANDLE; }
+        m_outputImageView = VK_NULL_HANDLE;
+        m_gBuffers.reset();
     }
 };
 
@@ -667,4 +997,9 @@ int main(int argc, char** argv)
 /**NOTE - Nvidia Reflex技术
 主要解决系统延迟的问题(游戏延迟分为三部分:网络延迟和系统延迟)
 通过Reflex技术降低系统延迟
+ */
+
+/**NOTE - Nvidia DLSS 深度学习超级采样
+1. DLSS 超分辨率
+2. DLSS 帧生成
  */
