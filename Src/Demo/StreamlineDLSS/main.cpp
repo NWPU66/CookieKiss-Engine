@@ -10,14 +10,13 @@
  */
 
 // c
-#include "imgui.h"
-#include "nvvk/images_vk.hpp"
 #include <cstdint>
 #include <cstdlib>
 
 // cpp
 #include <algorithm>
 #include <exception>
+#include <functional>
 #include <iostream>
 #include <iterator>
 #include <memory>
@@ -30,6 +29,7 @@
 #include "GLFW/glfw3.h"
 #include "backends/imgui_impl_glfw.h"
 #include "glm/glm.hpp"
+#include "imgui.h"
 #include <vulkan/vulkan_core.h>
 
 static const std::string PROJECT_NAME = "StreamlineDLSS";
@@ -40,6 +40,8 @@ static const std::string PROJECT_NAME = "StreamlineDLSS";
 #include "nvh/primitives.hpp"
 #include "nvvk/context_vk.hpp"
 #include "nvvk/descriptorsets_vk.hpp"
+#include "nvvk/dynamicrendering_vk.hpp"
+#include "nvvk/images_vk.hpp"
 #include "nvvk/memallocator_vma_vk.hpp"
 #include "nvvk/pipeline_vk.hpp"
 
@@ -161,6 +163,275 @@ public:
 
     void renderFrame(VkCommandBuffer cmd, sl::FrameToken* frame)
     {
+        const VkExtent2D renderSize  = m_gBuffers->getSize();  // BGuffer中图像的大小
+        const VkExtent2D outputSize  = getSize();              // 窗口大小
+        const float      aspectRatio = m_gBuffers->getAspectRatio();
+        const float      scalingRatio =
+            static_cast<float>(outputSize.width) /
+            static_cast<float>(renderSize.width);  // 窗口大小和图像大小的比例
+
+        // Get view information from camera
+        const glm::mat4 viewMatrix = CameraManip.getMatrix();      // WS->CameraSapce
+        const glm::vec2 clipPlanes = CameraManip.getClipPlanes();  // 近平面和远平面
+        glm::mat4       projMatrix = glm::perspectiveRH_ZO(glm::radians(CameraManip.getFov()),
+                                                           aspectRatio, clipPlanes.x, clipPlanes.y);
+#if !USE_D3D_CLIP_SPACE
+        projMatrix[1][1] *= -1;  // Flip the Y axis to convert from D3D to Vulkan:
+#endif
+
+        glm::vec3 geye, gcenter, gup;
+        CameraManip.getLookat(geye, gcenter, gup);
+        glm::vec3 eye     = geye;
+        glm::vec3 center  = gcenter;
+        glm::vec3 up      = gup;
+        glm::vec3 right   = glm::normalize(glm::cross(center - eye, up));
+        glm::vec3 forward = glm::normalize(center - eye);
+
+        // Calculate pixel jitter offset using Halton sequence
+        glm::vec2 jitterOffset = {};  // 抖动抗锯齿
+
+        if (m_dlssOptions.mode != sl::DLSSMode::eOff)
+        {
+            const std::function<float(uint32_t, uint32_t)> halton = [](uint32_t index,
+                                                                       uint32_t base) -> float {
+                float f = 1.0f;
+                float r = 0.0f;
+                while (index > 0)
+                {
+                    f *= static_cast<float>(base);
+                    r += static_cast<float>(index % base) / f;
+                    index /= base;
+                }
+                return r;
+            };
+            const auto jitterPhases = static_cast<uint32_t>(8 * scalingRatio * scalingRatio + 0.5f);
+            const uint32_t jitterCurrentIndex = (*frame % jitterPhases) + 1;
+            jitterOffset.x                    = halton(jitterCurrentIndex, 2) - 0.5f;
+            jitterOffset.y                    = halton(jitterCurrentIndex, 3) - 0.5f;
+        }
+
+        // Update Streamline constants
+        {
+            const std::function<sl::float4x4(const glm::mat4&)> matrixToSL =
+                [](const glm::mat4& m) -> sl::float4x4 {
+                // Streamline expects row-major matrices
+                sl::float4x4 res;
+                res.row[0].x = m[0][0];
+                res.row[0].y = m[1][0];  // 转置
+                res.row[0].z = m[2][0];
+                res.row[0].w = m[3][0];
+                res.row[1].x = m[0][1];
+                res.row[1].y = m[1][1];
+                res.row[1].z = m[2][1];
+                res.row[1].w = m[3][1];
+                res.row[2].x = m[0][2];
+                res.row[2].y = m[1][2];
+                res.row[2].z = m[2][2];
+                res.row[2].w = m[3][2];
+                res.row[3].x = m[0][3];
+                res.row[3].y = m[1][3];
+                res.row[3].z = m[2][3];
+                res.row[3].w = m[3][3];
+                return res;
+            };
+
+            sl::Constants constants;
+            constants.jitterOffset = sl::float2(jitterOffset.x, jitterOffset.y);
+            constants.mvecScale    = sl::float2(1.0f, 1.0f);  // 运动向量的缩放比例
+            // getMotion in scene.frag calculates normalized motion
+            // vectors already, so do not need to scale
+
+            glm::mat4 projMatrixD3D     = projMatrix;
+            glm::mat4 projMatrixPrevD3D = m_projMatrixPrev;
+#if USE_D3D_CLIP_SPACE
+            constants.mvecScale.y *= -1.0f;  // getMotion in scene.frag does not flip Y coordinate
+                                             // for D3D clip space, so do it via scaling
+#else
+            // Streamline expects clip space as defined in Direct3D (X left->right, Y bottom->top, Z
+            // front->back) But clip space in Vulkan is upside down (X left->right, Y top->bottom, Z
+            // front-back), so need to adjust projection matrices accordingly
+            projMatrixD3D[1][1] *= -1.0f;
+            projMatrixPrevD3D[1][1] *= -1.0f;
+#endif
+            const glm::mat4 reprojectionMatrix = projMatrixPrevD3D *
+                                                 (m_viewMatrixPrev * glm::inverse(viewMatrix)) *
+                                                 glm::inverse(projMatrixD3D);
+            // NOTE - 第n-1帧的NDC坐标 = reprojectionMatrix * 第n帧的NDC坐标
+
+            // camera space & clip space
+            constants.cameraViewToClip = matrixToSL(projMatrix);
+            constants.clipToCameraView = matrixToSL(glm::inverse(projMatrix));
+            constants.clipToLensClip   = matrixToSL(glm::mat4(1));
+            constants.clipToPrevClip   = matrixToSL(reprojectionMatrix);
+            constants.prevClipToClip   = matrixToSL(glm::inverse(reprojectionMatrix));
+
+            // camera
+            constants.cameraPinholeOffset = sl::float2(0.0f, 0.0f);
+            constants.cameraPos           = sl::float3(eye.x, eye.y, eye.z);
+            constants.cameraUp            = sl::float3(up.x, up.y, up.z);
+            constants.cameraRight         = sl::float3(right.x, right.y, right.z);
+            constants.cameraFwd           = sl::float3(forward.x, forward.y, forward.z);
+            constants.cameraNear          = clipPlanes.x;
+            constants.cameraFar           = clipPlanes.y;
+            constants.cameraFOV           = glm::radians(CameraManip.getFov());
+            constants.cameraAspectRatio   = aspectRatio;
+
+            constants.depthInverted =
+                (projMatrix[2][2] == 0.0f) ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+            // depthInverted：z深度是否离相机越近越大
+            constants.cameraMotionIncluded  = sl::Boolean::eTrue;
+            constants.motionVectors3D       = sl::Boolean::eFalse;
+            constants.reset                 = sl::Boolean::eFalse;
+            constants.motionVectorsJittered = sl::Boolean::eFalse;
+
+            if (SL_FAILED(res, slSetConstants(constants, *frame, m_viewportHandle)))
+            {
+                LOGE("Streamline: Failed to set constants (%d)\n", res);
+                return;
+            }
+        }
+
+        // Update frame info uniform buffer
+        {
+            FrameInfo frameInfo;
+            frameInfo.viewProj     = projMatrix * viewMatrix;
+            frameInfo.viewProjPrev = m_projMatrixPrev * m_viewMatrixPrev;
+            frameInfo.jitterOffset =
+                jitterOffset * 2.0f / glm::vec2(renderSize.width, renderSize.height);
+            frameInfo.camPos = eye;
+            vkCmdUpdateBuffer(cmd, m_frameInfo.buffer, 0, sizeof(frameInfo), &frameInfo);
+
+            VkBufferMemoryBarrier barrier{
+                .sType         = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                .pNext         = nullptr,
+                .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_UNIFORM_READ_BIT,
+                .buffer        = m_frameInfo.buffer,
+                .offset        = 0,
+                .size          = VK_WHOLE_SIZE,
+            };
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                 0, 1, &barrier, 0, nullptr, 0, nullptr);
+        }
+
+        // Scene rendering
+        {
+            std::vector<VkImageView> colorImageViews;
+            for (uint32_t i = 0; i < std::size(SAMPLE_COLOR_FORMATS); i++)
+            {
+                colorImageViews.push_back(m_gBuffers->getColorImageView(i));
+                nvvk::cmdBarrierImageLayout(cmd, m_gBuffers->getColorImage(i),
+                                            VK_IMAGE_LAYOUT_UNDEFINED,
+                                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            }
+            nvvk::cmdBarrierImageLayout(cmd, m_gBuffers->getDepthImage(), VK_IMAGE_LAYOUT_UNDEFINED,
+                                        VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                                        VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+
+            nvvk::createRenderingInfo renderingInfo(
+                VkRect2D{
+                    .offset = {0, 0},
+                    .extent = renderSize,
+                },
+                colorImageViews, m_gBuffers->getDepthImageView(), VK_ATTACHMENT_LOAD_OP_CLEAR,
+                VK_ATTACHMENT_LOAD_OP_CLEAR);
+            renderingInfo.colorAttachments[0].clearValue = {1.0f, 0.0f, 1.0f, 1.0f};  // Color
+            renderingInfo.colorAttachments[1].clearValue = {0.0f, 0.0f, 0.0f,
+                                                            0.0f};  // Motion vectors
+            renderingInfo.pStencilAttachment             = nullptr;
+            vkCmdBeginRendering(cmd, &renderingInfo);
+            // NOTE - vkCmdBeginRendering可以设置渲染期间用到的Attachment
+            // 好像不需要renderpass和帧缓存，单pass应该可以这么搞，多pass的话老老实实用renderpass和帧缓存吧
+
+#if USE_D3D_CLIP_SPACE
+            // Flip viewport to simulate D3D clip space (this is supported since the
+            // VK_KHR_maintenance1 extension)
+            const VkViewport viewport{
+                .x        = 0,
+                .y        = static_cast<float>(renderSize.height),
+                .width    = static_cast<float>(renderSize.width),
+                .height   = static_cast<float>(renderSize.height),
+                .minDepth = 0.0f,
+                .maxDepth = 1.0f,
+            };
+#else
+            const VkViewport viewport{
+                .x        = 0,
+                .y        = 0,
+                .width    = static_cast<float>(renderSize.width),
+                .height   = static_cast<float>(renderSize.height),
+                .minDepth = 0.0f,
+                .maxDepth = 1.0f,
+            };
+#endif
+            vkCmdSetViewport(cmd, 0, 1, &viewport);
+            const VkRect2D scissor{
+                .offset = {0, 0},
+                .extent = {renderSize.width, renderSize.height},
+            };
+            vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_scenePipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_dset->getPipeLayout(),
+                                    0, m_dset->getSetsCount(), m_dset->getSets(), 0, nullptr);
+            // NOTE - 图形管线的资源有三：1. 附着Attachment（帧缓存）；2. 描述符集和pushConstant；
+            // 4. 顶点输入和输入顶点组装
+
+            for (const Node& node : m_sceneNodes)
+            {
+                NodeInfo nodeInfo;
+                nodeInfo.model = nodeInfo.modelPrev = node.localMatrix();
+                if (node.motion)
+                {
+                    nodeInfo.model *= glm::translate(
+                        glm::mat4(1.f),
+                        {-sinf(fmodf(m_animationTime, glm::two_pi<float>())), 0.0f, 0.0f});
+                    nodeInfo.modelPrev *= glm::translate(
+                        glm::mat4(1.f),
+                        {-sinf(fmodf(m_animationTimePrev, glm::two_pi<float>())), 0.0f, 0.0f});
+                    // 这里设置了物体的运动
+                }
+                nodeInfo.color = glm::vec3(sin(glm::vec3(1.33333f, 2.33333f, 3.33333f) *
+                                               static_cast<float>(node.material)) *
+                                               0.5f +
+                                           0.5f);
+                vkCmdPushConstants(cmd, m_dset->getPipeLayout(),
+                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                                   sizeof(nodeInfo), &nodeInfo);
+                // NOTE - FrameInfo作为UniformBuffer设置进管线中，作为描述符集
+                // 而NodeInfo作为PushContent设置进管线中
+
+                const VkDeviceSize offsets = {0};
+                vkCmdBindVertexBuffers(cmd, 0, 1, &m_sceneMeshes[node.mesh].verticesBuffer.buffer,
+                                       &offsets);
+                vkCmdBindIndexBuffer(cmd, m_sceneMeshes[node.mesh].trianglesBuffer.buffer, 0,
+                                     VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexed(
+                    cmd, static_cast<uint32_t>(m_sceneMeshes[node.mesh].triangles.size() * 3), 1, 0,
+                    0, 0);
+            }
+
+            vkCmdEndRendering(cmd);
+        }
+
+        // Tag current state of resources needed for DLSS Super Resolution
+        {
+        }
+
+        if (m_dlssOptions.mode != sl::DLSSMode::eOff) {}
+        else {}
+
+        // Post-processing
+        {
+        }
+
+        // Tag current state of additional resources needed for DLSS Frame Generation
+        {
+        }
+
+        // ImGui rendering
         // TODO -
     }
 
@@ -464,6 +735,8 @@ private:
                 VK_SHADER_STAGE_FRAGMENT_BIT);
 
             m_scenePipeline = pipelineGenerator.createPipeline();
+            // NOTE - 这个pipelineGenerator好像不能指定subpass
+            // 它renderpass都有，为什么不能指定subpass？
         }
 
         // Create the post-processing pipeline
