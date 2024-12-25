@@ -34,7 +34,7 @@ target_include_directories(${DEMO_NAME} PRIVATE
 target_link_libraries(${DEMO_NAME} PRIVATE
     ${3rdparty}/nvpro_core_lib/nvpro_core_gl_vk_shaderc.lib
     Vulkan::Vulkan
-    # imgui::imgui
+    imgui::imgui
     # implot::implot
     glfw
     # fmt::fmt-header-only

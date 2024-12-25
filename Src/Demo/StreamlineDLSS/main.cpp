@@ -28,6 +28,7 @@
 #define GLFW_INCLUDE_VULKAN
 #include "GLFW/glfw3.h"
 #include "backends/imgui_impl_glfw.h"
+#include "backends/imgui_impl_vulkan.h"
 #include "glm/glm.hpp"
 #include "imgui.h"
 #include <vulkan/vulkan_core.h>
@@ -54,6 +55,10 @@ static const std::string PROJECT_NAME = "StreamlineDLSS";
 #include "streamline_wrapper.hpp"
 // NOTE - streamline_wrapper负责动态加载sl的函数，main.cpp不需要再include sl的头文件
 #include "Shaders/common.h"
+#include "Shaders/spirv/generated_spirv/post_frag.h"
+#include "Shaders/spirv/generated_spirv/post_vert.h"
+#include "Shaders/spirv/generated_spirv/scene_frag.h"
+#include "Shaders/spirv/generated_spirv/scene_vert.h
 
 // global variables
 static const int SAMPLE_WIDTH  = 1920;
@@ -313,7 +318,7 @@ public:
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                  VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
                                      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                                 0, 1, &barrier, 0, nullptr, 0, nullptr);
+                                 0, 0, nullptr, 1, &barrier, 0, nullptr);
         }
 
         // Scene rendering
@@ -418,21 +423,163 @@ public:
 
         // Tag current state of resources needed for DLSS Super Resolution
         {
+            sl::Resource colorInputResource(sl::ResourceType::eTex2d, m_gBuffers->getColorImage(0),
+                                            nullptr, m_gBuffers->getColorImageView(0),
+                                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            colorInputResource.width        = renderSize.width;
+            colorInputResource.height       = renderSize.height;
+            colorInputResource.nativeFormat = m_gBuffers->getColorFormat(0);
+            colorInputResource.mipLevels    = 1;
+            colorInputResource.arrayLayers  = 1;
+            colorInputResource.usage =
+                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT;  // See nvvkhl::GBuffer::create
+
+            sl::Resource colorOutputResource(sl::ResourceType::eTex2d, m_outputImage.image, nullptr,
+                                             m_outputImageView,
+                                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            colorOutputResource.width        = outputSize.width;
+            colorOutputResource.height       = outputSize.height;
+            colorOutputResource.nativeFormat = SAMPLE_COLOR_FORMATS[0];
+            colorOutputResource.mipLevels    = 1;
+            colorOutputResource.arrayLayers  = 1;
+            colorOutputResource.usage =
+                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;  // See createImages below
+
+            sl::Resource depthResource(sl::ResourceType::eTex2d, m_gBuffers->getDepthImage(),
+                                       nullptr, m_gBuffers->getDepthImageView(),
+                                       VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+            depthResource.width        = renderSize.width;
+            depthResource.height       = renderSize.height;
+            depthResource.nativeFormat = m_gBuffers->getDepthFormat();
+            depthResource.mipLevels    = 1;
+            depthResource.arrayLayers  = 1;
+            depthResource.usage        = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                  VK_IMAGE_USAGE_TRANSFER_DST_BIT;  // See nvvkhl::GBuffer::create
+
+            sl::Resource motionVectorsResource(
+                sl::ResourceType::eTex2d, m_gBuffers->getColorImage(1), nullptr,
+                m_gBuffers->getColorImageView(1), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            motionVectorsResource.width        = renderSize.width;
+            motionVectorsResource.height       = renderSize.height;
+            motionVectorsResource.nativeFormat = m_gBuffers->getColorFormat(1);
+            motionVectorsResource.mipLevels    = 1;
+            motionVectorsResource.arrayLayers  = 1;
+            motionVectorsResource.usage =
+                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT;  // See nvvkhl::GBuffer::create
+
+            const sl::ResourceTag tags[] = {
+                sl::ResourceTag(&colorInputResource, sl::kBufferTypeScalingInputColor,
+                                sl::ResourceLifecycle::eValidUntilPresent),
+                sl::ResourceTag(&colorOutputResource, sl::kBufferTypeScalingOutputColor,
+                                sl::ResourceLifecycle::eValidUntilPresent),
+                sl::ResourceTag(&depthResource, sl::kBufferTypeDepth,
+                                sl::ResourceLifecycle::eValidUntilPresent),
+                sl::ResourceTag(&motionVectorsResource, sl::kBufferTypeMotionVectors,
+                                sl::ResourceLifecycle::eValidUntilPresent),
+            };
+
+            slSetTag(m_viewportHandle, tags, static_cast<uint32_t>(std::size(tags)), cmd);
         }
 
-        if (m_dlssOptions.mode != sl::DLSSMode::eOff) {}
-        else {}
+        if (m_dlssOptions.mode != sl::DLSSMode::eOff)
+        {
+            nvvk::cmdBarrierImageLayout(cmd, m_outputImage.image, VK_IMAGE_LAYOUT_UNDEFINED,
+                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+            const sl::BaseStructure* inputs[] = {&m_viewportHandle};
+
+            if (SL_FAILED(res, slEvaluateFeature(sl::kFeatureDLSS, *frame, inputs,
+                                                 static_cast<uint32_t>(std::size(inputs)), cmd)))
+            {
+                LOGE("Streamline: Failed to evaluate DLSS Super Resolution (%d)\n", res);
+            }
+        }
+        else
+        {
+            nvvk::cmdBarrierImageLayout(cmd, m_outputImage.image,
+                                        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+            // When DLSS Super Resolution is off, 'm_outputImage' already points to
+            // 'm_gBuffers->getColorImage()', so no additional processing needed here
+        }
 
         // Post-processing
         {
+            nvvk::cmdBarrierImageLayout(cmd, m_swapChain.getActiveImage(),
+                                        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                                        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+            const nvvk::createRenderingInfo renderingInfo(
+                {{0, 0}, getSize()}, {m_swapChain.getActiveImageView()}, VK_NULL_HANDLE,
+                VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_LOAD_OP_DONT_CARE);
+            vkCmdBeginRendering(cmd, &renderingInfo);
+
+            const VkViewport viewport = {0.0f,
+                                         0.0f,
+                                         static_cast<float>(outputSize.width),
+                                         static_cast<float>(outputSize.height),
+                                         0.0f,
+                                         1.0f};
+            vkCmdSetViewport(cmd, 0, 1, &viewport);
+            const VkRect2D scissor = {{0, 0}, {outputSize.width, outputSize.height}};
+            vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_postPipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_dset->getPipeLayout(),
+                                    0, m_dset->getSetsCount(), m_dset->getSets(), 0, nullptr);
+
+            vkCmdDraw(cmd, 3, 1, 0, 0);
+
+            vkCmdEndRendering(cmd);
         }
 
         // Tag current state of additional resources needed for DLSS Frame Generation
         {
+            sl::Resource colorResource(sl::ResourceType::eTex2d, m_outputImage.image, nullptr,
+                                       m_outputImageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            colorResource.width        = outputSize.width;
+            colorResource.height       = outputSize.height;
+            colorResource.nativeFormat = SAMPLE_COLOR_FORMATS[0];
+            colorResource.mipLevels    = 1;
+            colorResource.arrayLayers  = 1;
+            colorResource.usage =
+                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;  // See createImages below
+
+            const sl::ResourceTag tags[] = {
+                sl::ResourceTag(&colorResource, sl::kBufferTypeHUDLessColor,
+                                sl::ResourceLifecycle::eValidUntilPresent),
+            };
+
+            slSetTag(m_viewportHandle, tags, static_cast<uint32_t>(std::size(tags)), cmd);
         }
 
         // ImGui rendering
-        // TODO -
+        if (ImDrawData* const drawData = ImGui::GetDrawData();
+            drawData != nullptr && drawData->TotalVtxCount != 0 && drawData->TotalIdxCount != 0)
+        {
+            const nvvk::createRenderingInfo renderingInfo(
+                {{0, 0}, getSize()}, {m_swapChain.getActiveImageView()}, VK_NULL_HANDLE,
+                VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_LOAD_OP_DONT_CARE);
+            vkCmdBeginRendering(cmd, &renderingInfo);
+
+            ImGui_ImplVulkan_RenderDrawData(drawData, cmd);
+
+            vkCmdEndRendering(cmd);
+        }
+
+        nvvk::cmdBarrierImageLayout(cmd, m_swapChain.getActiveImage(),
+                                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+
+        // Update previous matrices for next frame
+        m_projMatrixPrev = projMatrix;
+        m_viewMatrixPrev = viewMatrix;
     }
 
     void drawGui()
