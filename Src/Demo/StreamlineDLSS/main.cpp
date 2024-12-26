@@ -58,7 +58,7 @@ static const std::string PROJECT_NAME = "StreamlineDLSS";
 #include "Shaders/spirv/generated_spirv/post_frag.h"
 #include "Shaders/spirv/generated_spirv/post_vert.h"
 #include "Shaders/spirv/generated_spirv/scene_frag.h"
-#include "Shaders/spirv/generated_spirv/scene_vert.h
+#include "Shaders/spirv/generated_spirv/scene_vert.h"
 
 // global variables
 static const int SAMPLE_WIDTH  = 1920;

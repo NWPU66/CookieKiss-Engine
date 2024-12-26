@@ -4,10 +4,6 @@
 [submodule "3rdparty/heightmap_rtx"]
 	path = 3rdparty/heightmap_rtx
 	url = git@github.com:NVIDIAGameWorks/heightmap_rtx.git
-[submodule "3rdparty/imgui"]
-	path = 3rdparty/imgui
-	url = git@github.com:ocornut/imgui.git
-	branch = docking
 [submodule "3rdparty/Streamline"]
 	path = 3rdparty/Streamline
 	url = git@github.com:NVIDIAGameWorks/Streamline.git

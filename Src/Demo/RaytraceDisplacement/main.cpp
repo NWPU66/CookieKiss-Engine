@@ -23,7 +23,6 @@
 #include <chrono>
 #include <exception>
 #include <functional>
-#include <glm/matrix.hpp>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -42,7 +41,9 @@ constexpr std::string_view PROJECT_NAME = "RaytraceDisplacement";
 #include "imgui/backends/imgui_impl_vulkan.h"
 #include "imgui/imgui_camera_widget.h"
 #include "imgui/imgui_helper.h"
+#include <glm/matrix.hpp>
 #include <glm/vec4.hpp>
+#include <imgui_internal.h>
 #include <vulkan/vulkan_beta.h>
 #include <vulkan/vulkan_core.h>
 
