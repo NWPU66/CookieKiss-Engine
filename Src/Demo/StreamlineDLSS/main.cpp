@@ -81,6 +81,11 @@ static const VkFormat SAMPLE_COLOR_FORMATS[] = {
 
 #define USE_D3D_CLIP_SPACE 0
 
+void LogMessageCallback(sl::LogType type, const char* msg)
+{
+    LOGE("LogMessageCallback:\n");
+}
+
 class StreamlineSample : public nvvkhl::AppBaseVk {
 public:
     StreamlineSample()           = default;
@@ -1266,7 +1271,7 @@ int main(int argc, char** argv)
         // (this must happen before any Vulkan calls are made)
         sl::Preferences pref;
         pref.showConsole = true;
-        pref.logLevel    = sl::LogLevel::eVerbose;
+        pref.logLevel    = sl::LogLevel::eDefault;
 #if SL_MANUAL_HOOKING
         pref.flags |= sl::PreferenceFlags::eUseManualHooking;
 #endif
@@ -1276,8 +1281,9 @@ int main(int argc, char** argv)
         pref.engine            = sl::EngineType::eCustom;
         pref.engineVersion     = nullptr;
         pref.renderAPI         = sl::RenderAPI::eVulkan;
+        // pref.logMessageCallback = &LogMessageCallback;
 
-        if (SL_FAILED(res, slInit(pref)))
+        if (SL_FAILED(res, slInit(pref)))  // FIXME - 初始化失败
         {
             LOGE("Streamline: Initialization failed (%d)\n", res);
             return static_cast<int>(res);

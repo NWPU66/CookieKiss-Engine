@@ -18,3 +18,10 @@ Streamline 通常支持两种集成方法，第一种是自动集成，通过链
 
 要调试 DLSS，您可以用其开发版本替换 CMake 安装的 DLSS DLL，并通过特殊注册表键启用其覆盖。
 此外，请查看 Streamline ImGui 插件文档。可以通过在 main.cpp 顶部的 SL_FEATURES 数组中添加 sl::kFeatureImGUI 来启用它。
+
+## Streamline 自动链接和手动链接
+
+|          | Lib                                     | DLL                                                 |
+| -------- | --------------------------------------- | --------------------------------------------------- |
+| 手动链接 | vulkan-1.lib                            | 运行时通过 sl.interposer.dll 查找必要的 sl 函数入口地址 |
+| 自动链接 | sl.interposer.lib 而不链接 Vulkan-1.lib |                                                     |
