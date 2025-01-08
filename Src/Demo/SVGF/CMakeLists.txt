@@ -6,6 +6,8 @@ find_package(Vulkan REQUIRED)
 # find_package(imgui CONFIG REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
+find_package(tinyobjloader CONFIG REQUIRED)
+find_package(unofficial-shaderc CONFIG REQUIRED)
 # find_package(implot CONFIG REQUIRED)
 
 # src
@@ -25,6 +27,7 @@ target_include_directories(${DEMO_NAME} PUBLIC
     ${3rdparty}/nvpro_core/third_party
     ${3rdparty}/nvpro_core/nvp
     ${3rdparty}
+    ${3rdparty}/tinygltf
     ${VCPKG_INCLUDE_DIR}
     )
 
@@ -38,6 +41,8 @@ target_link_libraries(${DEMO_NAME} PRIVATE
     ${3rdparty}/Library/Debug/imgui.lib
     ${3rdparty}/Library/Debug/implot.lib
     Vulkan::Vulkan
+    unofficial::shaderc::shaderc
+    tinyobjloader::tinyobjloader
     # imgui::imgui
     # implot::implot
     glfw

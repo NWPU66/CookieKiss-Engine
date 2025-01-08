@@ -7,3 +7,6 @@
 [submodule "3rdparty/Streamline"]
 	path = 3rdparty/Streamline
 	url = git@github.com:NVIDIAGameWorks/Streamline.git
+[submodule "3rdparty/tinygltf"]
+	path = 3rdparty/tinygltf
+	url = git@github.com:syoyo/tinygltf.git
