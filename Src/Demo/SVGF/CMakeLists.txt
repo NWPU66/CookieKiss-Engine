@@ -41,7 +41,8 @@ target_link_libraries(${DEMO_NAME} PRIVATE
     ${3rdparty}/Library/Debug/imgui.lib
     ${3rdparty}/Library/Debug/implot.lib
     Vulkan::Vulkan
-    unofficial::shaderc::shaderc
+    E:/VulkanSDK/1.3.280.0/Lib/shaderc_shared.lib
+    # unofficial::shaderc::shaderc
     tinyobjloader::tinyobjloader
     # imgui::imgui
     # implot::implot

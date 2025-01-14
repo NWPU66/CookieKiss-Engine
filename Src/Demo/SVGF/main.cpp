@@ -2,6 +2,7 @@
 #define NOMINMAX  // NOTE - windows.h头文件中的min/max宏定义会与algorithm的std::min/max冲突
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
 #include <iostream>
 #include <string>
 
@@ -10,9 +11,7 @@
 #include "imgui.h"
 #include <fmt/core.h>
 #include <glm/ext/matrix_transform.hpp>
-#include <glm/ext/vector_float3.hpp>
 #include <glm/glm.hpp>
-#include <glm/trigonometric.hpp>
 #include <memory>
 #include <vector>
 #include <vulkan/vulkan_core.h>
@@ -21,14 +20,17 @@
 #define PROJECT_NAME "SVGF"
 #define VK_USE_PLATFORM_WIN32_KHR
 #define VMA_IMPLEMENTATION
+#define NVP_SUPPORTS_SHADERC true
 #include "nvh/cameramanipulator.hpp"
 #include "nvvk/context_vk.hpp"
+#include "nvvk/debug_util_vk.hpp"
 #include "nvvk/descriptorsets_vk.hpp"
 #include "nvvk/dynamicrendering_vk.hpp"
 #include "nvvk/memallocator_vma_vk.hpp"
 #include "nvvk/pipeline_vk.hpp"
 #include "nvvk/renderpasses_vk.hpp"
 #include "nvvk/resourceallocator_vk.hpp"
+#include "nvvk/shadermodulemanager_vk.hpp"
 #include "nvvk/shaders_vk.hpp"
 #include "nvvkhl/application.hpp"
 #include "nvvkhl/element_camera.hpp"
@@ -45,29 +47,18 @@
 // define all the "tiny_gltf.h" implementation after "gltf_scene_vk.hpp"
 
 // users
+#define LOAD_METHOD_TINYOBJLOADER
+#include "AssetLoader.h"
 #include "Shader/common.h"
-#include "Shader/spv/simpleFrag.h"
-#include "Shader/spv/simpleVert.h"
 
 // global variables
-const std::string shaderFolder = "E:/Study/CodeProj/CookieKiss-Engine/Src/Demo/SVGF/Shader/spv";
-const std::string meshFile =
-    "E:/Study/CodeProj/CookieKiss-Engine/Asset/dae_diorama_rustborn/scene.gltf";
+const std::string shaderFolder = "E:/Study/CodeProj/CookieKiss-Engine/Src/Demo/SVGF/Shader";
+// const std::string meshFile =
+//     "E:/Study/CodeProj/CookieKiss-Engine/Asset/dae_diorama_rustborn/scene.gltf";
+const std::string meshFile    = "E:/Study/CodeProj/CookieKiss-Engine/Asset/cube.glb";
 const std::string assetFolder = "E:/Study/CodeProj/CookieKiss-Engine/Asset";
 
-class SVGFElement : public nvvkhl::IAppElement {
-    // TODO -
-
-public:
-    void onAttach(nvvkhl::Application* app) override {}
-    void onDetach() override {}
-    void onResize(uint32_t width, uint32_t height) override {}
-    void onUIRender() override {}
-    void onUIMenu() override {}
-    void onRender(VkCommandBuffer cmd) override {}
-
-private:
-};
+class SVGFElement : public nvvkhl::IAppElement {};
 
 class SimpleGraphicsElement : public nvvkhl::IAppElement {
 public:
@@ -77,6 +68,7 @@ public:
         m_app       = app;
         m_allocator = std::make_unique<nvvk::ResourceAllocatorVma>(
             m_app->getInstance(), m_app->getDevice(), m_app->getPhysicalDevice());
+        m_debug.setup(m_app->getDevice());
         loadScene();
         createResources();  // 创建描述符集要在加载场景后
         prepareCamera();
@@ -151,6 +143,9 @@ public:
         p[1][1] *= -1;
         auto v  = CameraManip.getMatrix();
         auto vp = p * v;
+        /*REVIEW - 我还是不理解这里为什么用 RH
+        vulkan的NDC空间就是右手系的，p[1][1]乘上-1后会变成左手系
+        */
 
         // binding vertex buffer
         const auto& nodes            = m_scene.getRenderNodes();
@@ -176,7 +171,7 @@ public:
             vkCmdBindIndexBuffer(cmd, EBO.buffer, 0, VK_INDEX_TYPE_UINT32);
 
             auto        m = node.worldMatrix;
-            PushContent pc{.mvp = vp * m};
+            PushContent pc{.m = m, .mvp = vp * m};
             vkCmdPushConstants(cmd, m_pipelineLayout,
                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                sizeof(PushContent), &pc);
@@ -189,7 +184,21 @@ public:
             // draw
             vkCmdDrawIndexed(cmd, prim.indexCount, 1, 0, 0, 0);
 
-            // FIXME - 坐标转换很怪，检查一下投影变换吧
+            /*FIXME - 现在出现的一些问题：
+            1. 坐标转换很怪，检查一下投影变换吧：
+            好像就是视场角的问题，改成45度就好很多了
+
+            2. 顺时针是正面，设置一下绘制正面的规则：
+            用Blender看了面朝向，就是这么变态，所以我只好设置成不剔除背面
+
+            3. 鼠标和键盘操纵摄像机的逻辑有问题，操作很反人类
+
+            4. 搞一下即时编译shader，现在手动编译太麻烦了
+            修好了，we use release shaderc_shared on Windows and release shaderc_combined on Linux.
+
+            5. normal 和 texcoord 明显有问题
+            36顶点只有18法线而且有些法线明显有问题
+            */
         }
 
         vkCmdEndRendering(cmd);
@@ -198,6 +207,7 @@ public:
 private:
     nvvkhl::Application*                     m_app;
     std::unique_ptr<nvvk::ResourceAllocator> m_allocator;
+    nvvk::DebugUtil                          m_debug;
 
     // resource
     nvvk::DescriptorSetContainer     m_descriptorSetContainer;
@@ -208,9 +218,7 @@ private:
     nvh::gltf::Scene                 m_scene;
 
     // pipeline
-    //  nvvk::ShaderModuleManager   m_shaderManager;
-    VkShaderModule              m_vertexShader;
-    VkShaderModule              m_fragmentShader;
+    nvvk::ShaderModuleManager   m_shaderManager;
     nvvk::GraphicsPipelineState m_pipelineState;
     VkPipelineLayout            m_pipelineLayout;
     VkPipeline                  m_pipeline;
@@ -267,6 +275,13 @@ private:
         // buffer，则创建15个描述符集，每个描述符集包含两个描述符。
         // 这15个描述符集的布局、管线布局相同。
 
+        /*NOTE - 讲一下vu来看中descriptor的结构
+        最大的是desc pool，只有它持有资源，其他对象只持有应用。
+        一个pool中包含多个desc set，每个set的布局相同。
+        一个desc set中包含多个绑定点，每个绑定点指明一项描述符类型。
+        一个绑定点中可以包含多个相同类型的desc，它们组成一个数组，在shader中通过数组索引来访问。
+        */
+
         // 管线布局
         VkPushConstantRange pushConstantRange{
             .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -280,11 +295,13 @@ private:
     {
         std::cout << "createGraphicsPipeline()" << std::endl;
 
-        // Shaders
-        m_vertexShader =
-            nvvk::createShaderModule(m_app->getDevice(), (char*)simpleVert, std::size(simpleVert));
-        m_fragmentShader =
-            nvvk::createShaderModule(m_app->getDevice(), (char*)simpleFrag, std::size(simpleFrag));
+        // SMM
+        m_shaderManager.init(m_app->getDevice());
+        m_shaderManager.addDirectory(shaderFolder);
+        auto vid = m_shaderManager.createShaderModule(VK_SHADER_STAGE_VERTEX_BIT,
+                                                      "SimpleGraphicsTest.vert");
+        auto fid = m_shaderManager.createShaderModule(VK_SHADER_STAGE_FRAGMENT_BIT,
+                                                      "SimpleGraphicsTest.frag");
 
         // renderingCreate
         VkFormat                      colorAttachmentFormat = VK_FORMAT_R32G32B32A32_SFLOAT;
@@ -313,16 +330,17 @@ private:
                 .offset   = 0,
             },
         });
+        m_pipelineState.rasterizationState.frontFace = VK_FRONT_FACE_CLOCKWISE;
+        m_pipelineState.rasterizationState.cullMode  = VK_CULL_MODE_NONE;
         // NOTE - GraphicsPipelineState初始化一些常见的管线选项，比如动态视口大小
         // 所以在onRender函数中要手动调用vkCmdSetViewport
 
         // pipeline generator
         nvvk::GraphicsPipelineGenerator generator(m_app->getDevice(), m_pipelineLayout,
                                                   renderingCreateInfo, m_pipelineState);
-        generator.addShader(m_vertexShader, VK_SHADER_STAGE_VERTEX_BIT);
-        generator.addShader(m_fragmentShader, VK_SHADER_STAGE_FRAGMENT_BIT);
+        generator.addShader(m_shaderManager.get(vid), VK_SHADER_STAGE_VERTEX_BIT);
+        generator.addShader(m_shaderManager.get(fid), VK_SHADER_STAGE_FRAGMENT_BIT);
         m_pipeline = generator.createPipeline();
-        // NOTE - 缺少Shader，shaderc预编译的库有点问题，用"nvvk/shader_vk.hpp"代替
     }
 
     void loadScene()
@@ -341,18 +359,29 @@ private:
     void prepareCamera()
     {
         CameraManip.setWindowSize(1920, 1080);
-        CameraManip.setLookat(glm::vec3(0, 0, 1), glm::vec3(0), glm::vec3(0, 1, 0));
+        CameraManip.setLookat(glm::vec3(0, 0, -1), glm::vec3(0), glm::vec3(0, 1, 0));
+        CameraManip.setMode(nvh::CameraManipulator::Modes::Fly);
     }
 
     void processEvent()
     {
-        if (ImGui::GetIO().MouseDown[0])
+        if (ImGui::IsMouseDown(ImGuiMouseButton_::ImGuiMouseButton_Left))
         {
-            auto [x, y] = ImGui::GetIO().MousePos;
-            CameraManip.setMousePosition(x, y);
+            std::cout << "Down" << std::endl;
         }
-
-        // TODO -
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_::ImGuiMouseButton_Left))
+        {
+            std::cout << "Clicked" << std::endl;
+        }
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_::ImGuiMouseButton_Left))
+        {
+            std::cout << "Dragging" << std::endl;
+        }
+        /*NOTE - IsMouseDown、IsMouseClicked、IsMouseDragging
+        IsMouseClicked只在按下时触发一次
+        IsMouseDown在按下时持续触发
+        IsMouseDragging在按下并拖动时持续触发
+        */
     }
 
     void destroyResources()
@@ -379,6 +408,9 @@ int main(int argc, char** argv)
     nvvkhl::addSurfaceExtensions(contextInfo.instanceExtensions);
     contextInfo.addDeviceExtension(VK_NV_RAY_TRACING_EXTENSION_NAME);
     contextInfo.addDeviceExtension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+    contextInfo.addDeviceExtension(
+        VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);  // required by
+                                                          // VK_KHR_acceleration_structure
     nvvk::Context context;
     context.init(contextInfo);
 
