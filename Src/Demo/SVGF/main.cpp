@@ -1,4 +1,7 @@
 // c/cpp
+#include "nvh/primitives.hpp"
+#include <cstddef>
+#include <iterator>
 #define NOMINMAX  // NOTE - windows.h头文件中的min/max宏定义会与algorithm的std::min/max冲突
 #include <algorithm>
 #include <cstdint>
@@ -48,6 +51,7 @@
 
 // users
 #define LOAD_METHOD_TINYOBJLOADER
+#define TINYOBJLOADER_IMPLEMENTATION
 #include "AssetLoader.h"
 #include "Shader/common.h"
 
@@ -55,7 +59,7 @@
 const std::string shaderFolder = "E:/Study/CodeProj/CookieKiss-Engine/Src/Demo/SVGF/Shader";
 // const std::string meshFile =
 //     "E:/Study/CodeProj/CookieKiss-Engine/Asset/dae_diorama_rustborn/scene.gltf";
-const std::string meshFile    = "E:/Study/CodeProj/CookieKiss-Engine/Asset/cube.glb";
+const std::string meshFile    = "E:/Study/CodeProj/CookieKiss-Engine/Asset/cube/cube.obj";
 const std::string assetFolder = "E:/Study/CodeProj/CookieKiss-Engine/Asset";
 
 class SVGFElement : public nvvkhl::IAppElement {};
@@ -138,7 +142,7 @@ public:
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
 
         // pre-calculate v and p
-        auto p = glm::perspectiveFovLH_ZO(glm::radians(90.0f), (float)size.width,
+        auto p = glm::perspectiveFovRH_ZO(glm::radians(45.0f), (float)size.width,
                                           (float)size.height, 0.001f, 100.0f);
         p[1][1] *= -1;
         auto v  = CameraManip.getMatrix();
@@ -147,44 +151,35 @@ public:
         vulkan的NDC空间就是右手系的，p[1][1]乘上-1后会变成左手系
         */
 
-        // binding vertex buffer
-        const auto& nodes            = m_scene.getRenderNodes();
-        const auto& VBOs             = m_VKScene->vertexBuffers();
-        const auto& EBOs             = m_VKScene->indices();
-        const auto& renderPrimitives = m_scene.getRenderPrimitives();
-        for (size_t i = 0; i < nodes.size(); i++)
+        // rendering instances
+        for (auto& inst : m_instances)
         {
-            auto&       node = nodes[i];
-            const auto& VBO  = VBOs[node.renderPrimID];
-            const auto& EBO  = EBOs[node.renderPrimID];
-            const auto& prim = renderPrimitives[node.renderPrimID];
+            auto& prim = m_primities[inst.mesh];
+            auto& VBO  = m_sceneDataGPU[inst.mesh].vertexBuffer;
+            auto& EBO  = m_sceneDataGPU[inst.mesh].indexBuffer;
+
+            // binding descriptor sets
+            VkDescriptorSet descSet[] = {m_descriptorSetContainer.getSet()};
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0,
+                                    std::size(descSet), descSet, 0, nullptr);
 
             // binding vertex buffer
-            VkBuffer     buffers[] = {VBO.position.buffer};
             VkDeviceSize offsets[] = {0};
-            vkCmdBindVertexBuffers(cmd, 0, std::size(buffers), buffers, offsets);
-            // NOTE - 一部分buffer为空，例如tangent、uv1和color buffer
-            // FIXME - gltf_scene_vk.hpp中的normal、uv buffer没有VK_VERTEX_SHADER_STAGE_FLAG_BIT，
-            // 无法作为顶点属性，把他们作为管线的外部描述符接入，用gl_VertexIndex进行索引
-
-            // binding index buffer
             vkCmdBindIndexBuffer(cmd, EBO.buffer, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdBindVertexBuffers(cmd, 0, std::size(offsets), &VBO.buffer, offsets);
 
-            auto        m = node.worldMatrix;
-            PushContent pc{.m = m, .mvp = vp * m};
+            // push constant
+            auto        model = inst.localMatrix();
+            PushContent pc{.m = model, .mvp = vp * model};
             vkCmdPushConstants(cmd, m_pipelineLayout,
                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                               sizeof(PushContent), &pc);
-
-            // binding desc set
-            auto pDescriptorSets = m_descriptorSetContainer.getSet(i);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1,
-                                    &pDescriptorSets, 0, nullptr);
+                               sizeof(pc), &pc);
 
             // draw
-            vkCmdDrawIndexed(cmd, prim.indexCount, 1, 0, 0, 0);
+            vkCmdDrawIndexed(cmd, prim.triangles.size() * 3, 1, 0, 0, 0);
+        }
 
-            /*FIXME - 现在出现的一些问题：
+        /*FIXME - 现在出现的一些问题：
             1. 坐标转换很怪，检查一下投影变换吧：
             好像就是视场角的问题，改成45度就好很多了
 
@@ -199,12 +194,17 @@ public:
             5. normal 和 texcoord 明显有问题
             36顶点只有18法线而且有些法线明显有问题
             */
-        }
 
         vkCmdEndRendering(cmd);
     }
 
 private:
+    struct SceneDataGPU
+    {
+        nvvk::Buffer vertexBuffer;
+        nvvk::Buffer indexBuffer;
+    };
+
     nvvkhl::Application*                     m_app;
     std::unique_ptr<nvvk::ResourceAllocator> m_allocator;
     nvvk::DebugUtil                          m_debug;
@@ -214,8 +214,9 @@ private:
     std::unique_ptr<nvvkhl::GBuffer> m_gbuffer;
 
     // Geometry
-    std::unique_ptr<nvvkhl::SceneVk> m_VKScene;
-    nvh::gltf::Scene                 m_scene;
+    std::vector<nvh::PrimitiveMesh> m_primities;
+    std::vector<nvh::Node>          m_instances;
+    std::vector<SceneDataGPU>       m_sceneDataGPU;
 
     // pipeline
     nvvk::ShaderModuleManager   m_shaderManager;
@@ -236,44 +237,8 @@ private:
 
         // descriptor and pipeline layout
         m_descriptorSetContainer.init(m_app->getDevice());
-        // add pipeline descriptor
-        m_descriptorSetContainer.addBinding(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
-                                            VK_SHADER_STAGE_VERTEX_BIT);  // normal buffer
-        m_descriptorSetContainer.addBinding(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
-                                            VK_SHADER_STAGE_VERTEX_BIT);  // texcoords buffer
         m_descriptorSetContainer.initLayout();
-        auto& nodes = m_scene.getRenderNodes();
-        m_descriptorSetContainer.initPool(nodes.size());
-
-        // update pipeline descriptor
-        const auto& VBOs = m_VKScene->vertexBuffers();
-        for (size_t i = 0; i < nodes.size(); i++)
-        {
-            auto&       node = nodes[i];
-            const auto& VBO  = VBOs[node.renderPrimID];
-
-            VkDescriptorBufferInfo normalBufferInfo{
-                .buffer = VBO.normal.buffer,
-                .offset = 0,
-                .range  = VK_WHOLE_SIZE,
-            };
-            VkDescriptorBufferInfo texcoordsBufferInfo{
-                .buffer = VBO.texCoord0.buffer,
-                .offset = 0,
-                .range  = VK_WHOLE_SIZE,
-            };
-            VkWriteDescriptorSet writeDescriptorSets[] = {
-                m_descriptorSetContainer.makeWrite(i, 0, &normalBufferInfo, 1),
-                m_descriptorSetContainer.makeWrite(i, 1, &texcoordsBufferInfo, 1),
-            };
-
-            vkUpdateDescriptorSets(m_app->getDevice(), std::size(writeDescriptorSets),
-                                   writeDescriptorSets, 0, nullptr);
-        }
-        // NOTE - 描述符集的设置，为每一个要渲染的节点创建一个描述符集
-        // 例如有15个渲染节点，每次渲染需要一个normal buffer和一个texcoords
-        // buffer，则创建15个描述符集，每个描述符集包含两个描述符。
-        // 这15个描述符集的布局、管线布局相同。
+        m_descriptorSetContainer.initPool(1);
 
         /*NOTE - 讲一下vu来看中descriptor的结构
         最大的是desc pool，只有它持有资源，其他对象只持有应用。
@@ -318,19 +283,32 @@ private:
         m_pipelineState.addBindingDescriptions({
             VkVertexInputBindingDescription{
                 .binding   = 0,
-                .stride    = sizeof(glm::vec3),  // position
+                .stride    = sizeof(nvh::PrimitiveVertex),
                 .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
             },
+
         });
         m_pipelineState.addAttributeDescriptions({
             VkVertexInputAttributeDescription{
                 .location = 0,
                 .binding  = 0,
-                .format   = VK_FORMAT_R32G32B32_SFLOAT,
-                .offset   = 0,
+                .format   = VK_FORMAT_R32G32B32_SFLOAT,  // postion
+                .offset   = offsetof(nvh::PrimitiveVertex, p),
+            },
+            VkVertexInputAttributeDescription{
+                .location = 1,
+                .binding  = 0,
+                .format   = VK_FORMAT_R32G32B32_SFLOAT,  // normal
+                .offset   = offsetof(nvh::PrimitiveVertex, n),
+            },
+            VkVertexInputAttributeDescription{
+                .location = 2,
+                .binding  = 0,
+                .format   = VK_FORMAT_R32G32_SFLOAT,  // texcoords
+                .offset   = offsetof(nvh::PrimitiveVertex, t),
             },
         });
-        m_pipelineState.rasterizationState.frontFace = VK_FRONT_FACE_CLOCKWISE;
+        // m_pipelineState.rasterizationState.frontFace = VK_FRONT_FACE_CLOCKWISE;
         m_pipelineState.rasterizationState.cullMode  = VK_CULL_MODE_NONE;
         // NOTE - GraphicsPipelineState初始化一些常见的管线选项，比如动态视口大小
         // 所以在onRender函数中要手动调用vkCmdSetViewport
@@ -345,14 +323,29 @@ private:
 
     void loadScene()
     {
-        // load scene
-        if (!m_scene.load(meshFile)) { std::cerr << "Error loading scene" << std::endl; }
+        // create scene primitives
+        m_primities = cookiekiss::loadGeometryFromFile(meshFile);
 
-        // create vkScene
-        auto cmd  = m_app->createTempCmdBuffer();
-        m_VKScene = std::make_unique<nvvkhl::SceneVk>(
-            m_app->getDevice(), m_app->getPhysicalDevice(), m_allocator.get());
-        m_VKScene->create(cmd, m_scene);
+        // create scene instances
+        m_instances.reserve(m_primities.size());
+        for (int i = 0; i < m_primities.size(); i++)
+        {
+            m_instances.push_back(nvh::Node{.mesh = i});
+        }
+
+        // upload scene data to gpu
+        auto cmd = m_app->createTempCmdBuffer();
+        m_sceneDataGPU.reserve(m_primities.size());
+        for (auto& prim : m_primities)
+        {
+            auto vertexBuffer = m_allocator->createBuffer(
+                cmd, prim.vertices, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            auto indexBuffer = m_allocator->createBuffer(
+                cmd, prim.triangles, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            m_sceneDataGPU.emplace_back(vertexBuffer, indexBuffer);
+        }
         m_app->submitAndWaitTempCmdBuffer(cmd);
     }
 
@@ -394,8 +387,11 @@ private:
 
     void destoryScene()
     {
-        m_VKScene.reset();
-        m_scene.destroy();
+        for (auto& sceneData : m_sceneDataGPU)
+        {
+            m_allocator->destroy(sceneData.vertexBuffer);
+            m_allocator->destroy(sceneData.indexBuffer);
+        }
     }
 };
 
