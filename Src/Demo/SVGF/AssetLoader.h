@@ -2,7 +2,10 @@
 
 // c/c++
 #include <cstddef>
+#include <cstdint>
+#include <iostream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 // third party
@@ -14,10 +17,16 @@
 // #define LOAD_METHOD_TINYOBJLOADER
 
 #ifdef LOAD_METHOD_ASSIMP
+#    include <assimp/Importer.hpp>
+#    include <assimp/postprocess.h>
+#    include <assimp/scene.h>
 #    ifdef LOAD_METHOD_TINYOBJLOADER
 #        error                                                                                     \
             "Both LOAD_METHOD_ASSIMP and LOAD_METHOD_TINYOBJLOADER are defined. Only one can be defined."
 #    endif
+#endif
+#ifdef LOAD_METHOD_TINYOBJLOADER
+#    include <tinyobjloader/tiny_obj_loader.h>
 #endif
 
 /* NOTE - nvh Primitives
@@ -42,25 +51,117 @@ struct PrimitiveMesh
 
 namespace cookiekiss {
 
-std::vector<nvh::PrimitiveMesh> loadGeometryFromFile(const std::string& filePath);
+std::tuple<std::vector<nvh::PrimitiveMesh>, std::vector<nvh::Node>>
+loadGeometryFromFile(const std::string& filePath, bool loadInstances = false);
 
 #ifdef LOAD_METHOD_ASSIMP
 
-std::vector<nvh::PrimitiveMesh> loadGeometryFromFile(const std::string& filePath)
+glm::vec3 toGlmVec3(const aiVector3D& vec)
 {
-    // TODO -
+    return {vec.x, vec.y, vec.z};
+}
+
+glm::vec2 toGlmVec2(const aiVector3D& vec)
+{
+    return {vec.x, vec.y};
+}
+
+void processNode(aiNode* node, const aiScene* scene)
+{
+    // 处理节点所有的网格（如果有的话）
+    for (unsigned int i = 0; i < node->mNumMeshes; i++)
+    {
+        // TODO -
+    }
+
+    // 接下来对它的子节点重复这一过程
+    for (unsigned int i = 0; i < node->mNumChildren; i++)
+    {
+        processNode(node->mChildren[i], scene);
+    }
+}
+
+std::tuple<std::vector<nvh::PrimitiveMesh>, std::vector<nvh::Node>>
+loadGeometryFromFile(const std::string& filePath, bool loadInstances)
+{
+    Assimp::Importer importer;
+    const aiScene*   scene = importer.ReadFile(filePath, aiProcessPreset_TargetRealtime_MaxQuality);
+    if (!scene || scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE || !scene->mRootNode)
+    {
+        std::cout << "ERROR::ASSIMP::" << importer.GetErrorString() << std::endl;
+        throw std::runtime_error(std::string("ERROR::ASSIMP::") + importer.GetErrorString());
+        return {};
+    }
+
+    std::vector<nvh::PrimitiveMesh> primitives(scene->mNumMeshes, {});
+    std::vector<nvh::Node>          instances;
+
+    // create primitives using meshes
+    for (uint32_t i = 0; i < scene->mNumMeshes; i++)
+    {
+        aiMesh* mesh = scene->mMeshes[i];
+        auto&   prim = primitives[i];
+        prim.vertices.reserve(mesh->mNumVertices);
+        prim.triangles.reserve(mesh->mNumFaces);
+
+        // vertex
+        for (uint32_t j = 0; j < mesh->mNumVertices; j++)
+        {
+            nvh::PrimitiveVertex vertex{
+                .p = toGlmVec3(mesh->mVertices[j]),
+                .n = toGlmVec3(mesh->mNormals[j]),
+                .t = toGlmVec2(mesh->mTextureCoords[0][j]),
+            };
+            prim.vertices.push_back(vertex);
+        }
+
+        // index
+        for (unsigned int j = 0; j < mesh->mNumFaces; j++)
+        {
+            aiFace&                face = mesh->mFaces[j];
+            nvh::PrimitiveTriangle index{
+                glm::uvec3{
+                    face.mIndices[0],
+                    face.mIndices[1],
+                    face.mIndices[2],
+                },
+            };
+            prim.triangles.push_back(index);
+        }
+
+        // TODO - textures
+        if (mesh->mMaterialIndex >= 0)
+        {
+            aiMaterial* material = scene->mMaterials[mesh->mMaterialIndex];
+        }
+    }
+
+    if (loadInstances)
+    {
+        // TODO - create instance for nodes
+        processNode(scene->mRootNode, scene);
+    }
+
+    return {primitives, instances};
 }
 
 #endif
 
-// ================================================================
+// ======================================================================
 
 #ifdef LOAD_METHOD_TINYOBJLOADER
 
-#    include <tinyobjloader/tiny_obj_loader.h>
-
-std::vector<nvh::PrimitiveMesh> loadGeometryFromFile(const std::string& filePath)
+std::tuple<std::vector<nvh::PrimitiveMesh>, std::vector<nvh::Node>>
+loadGeometryFromFile(const std::string& filePath, bool loadInstancesv)
 {
+    // 判断文件的后缀是不是.obj
+    if (filePath.substr(filePath.find_last_of(".") + 1) != "obj")
+    {
+        std::cout << "Error: File is not a .obj file." << std::endl;
+        throw std::runtime_error("File is not a .obj file.");
+        return {};
+    }
+
     tinyobj::attrib_t                attrib;
     std::vector<tinyobj::shape_t>    shapes;
     std::vector<tinyobj::material_t> materials;
@@ -142,7 +243,8 @@ std::vector<nvh::PrimitiveMesh> loadGeometryFromFile(const std::string& filePath
         }
     }
 
-    return primitives;
+    // no instances to create
+    return {primitives, {}};
     // NOTE - std::vector<nvh::PrimitiveMesh> primitives = std::move(loadGeometryFromFile(......));
 
     /* NOTE -

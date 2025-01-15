@@ -1,12 +1,14 @@
 // c/cpp
-#include "nvh/primitives.hpp"
-#include <cstddef>
-#include <iterator>
+#include <array>
+#include <assimp/material.h>
 #define NOMINMAX  // NOTE - windows.h头文件中的min/max宏定义会与algorithm的std::min/max冲突
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
+#include <iterator>
+#include <set>
 #include <string>
 
 // 3rdparty
@@ -19,12 +21,17 @@
 #include <vector>
 #include <vulkan/vulkan_core.h>
 
+#include <assimp/Importer.hpp>
+#include <assimp/postprocess.h>
+#include <assimp/scene.h>
+
 // 3rdparty - nvvk
 #define PROJECT_NAME "SVGF"
 #define VK_USE_PLATFORM_WIN32_KHR
 #define VMA_IMPLEMENTATION
 #define NVP_SUPPORTS_SHADERC true
 #include "nvh/cameramanipulator.hpp"
+#include "nvh/primitives.hpp"
 #include "nvvk/context_vk.hpp"
 #include "nvvk/debug_util_vk.hpp"
 #include "nvvk/descriptorsets_vk.hpp"
@@ -50,9 +57,9 @@
 // define all the "tiny_gltf.h" implementation after "gltf_scene_vk.hpp"
 
 // users
-#define LOAD_METHOD_TINYOBJLOADER
-#define TINYOBJLOADER_IMPLEMENTATION
-#include "AssetLoader.h"
+// #define LOAD_METHOD_TINYOBJLOADER
+// #define TINYOBJLOADER_IMPLEMENTATION
+// #include "AssetLoader.h"
 #include "Shader/common.h"
 
 // global variables
@@ -62,6 +69,255 @@ const std::string shaderFolder = "E:/Study/CodeProj/CookieKiss-Engine/Src/Demo/S
 const std::string meshFile    = "E:/Study/CodeProj/CookieKiss-Engine/Asset/cube/cube.obj";
 const std::string assetFolder = "E:/Study/CodeProj/CookieKiss-Engine/Asset";
 
+glm::vec3 toGlmVec3(const aiVector3D& vec)
+{
+    return {vec.x, vec.y, vec.z};
+}
+
+glm::vec2 toGlmVec2(const aiVector3D& vec)
+{
+    return {vec.x, vec.y};
+}
+
+namespace cookiekiss {
+
+class TextureCPU {
+public:
+    TextureCPU(int                _width,
+               int                _height,
+               int                _channels,
+               unsigned char*     _data,
+               const std::string& _filePath)
+    {
+        init(_width, _height, _channels, _data, _filePath);
+    }
+
+    TextureCPU(const std::string& textureFile)
+    {
+        int            _width    = 0;
+        int            _height   = 0;
+        int            _channels = 0;
+        unsigned char* _data     = stbi_load(textureFile.c_str(), &_width, &_height, &_channels, 0);
+        if (_data == nullptr)
+        {
+            std::cout << "Failed to load texture: " << textureFile << std::endl;
+            throw std::runtime_error("Failed to load texture");
+        }
+        init(_width, _height, _channels, _data, textureFile);
+    }
+
+    ~TextureCPU() { stbi_image_free(data); }
+
+private:
+    int            width    = -1;
+    int            height   = -1;
+    int            channels = -1;
+    unsigned char* data;
+    std::string    filePath;
+
+    void
+    init(int _width, int _height, int _channels, unsigned char* _data, const std::string& _filePath)
+    {
+        width    = _width;
+        height   = _height;
+        channels = _channels;
+        data     = _data;
+        filePath = _filePath;
+    }
+};
+
+class Scene {
+public:
+    void init(nvvkhl::Application* app) { m_app = app; }
+
+    void createScene(const std::string& filePath, std::unique_ptr<nvvk::ResourceAllocator>& alloc)
+    {
+        if (m_app == nullptr)
+        {
+            std::cout << "m_app is null" << std::endl;
+            return;
+        }
+        createSceneCPU(filePath);
+        createSceneGPU(alloc);
+    }
+
+    void destroy(std::unique_ptr<nvvk::ResourceAllocator>& alloc)
+    {
+        destroyCPU();
+        destroyGPU(alloc);
+    }
+
+    void destroyCPU()
+    {
+        m_primities.clear();
+        m_instances.clear();
+        m_texturesCPU.clear();
+    }
+
+    void destroyGPU(std::unique_ptr<nvvk::ResourceAllocator>& alloc)
+    {
+        for (auto& vb : m_sceneDataGPU.vertexBuffer)
+        {
+            alloc->destroy(vb);
+        }
+        for (auto& ib : m_sceneDataGPU.indexBuffer)
+        {
+            alloc->destroy(ib);
+        }
+        for (auto& tex : m_sceneDataGPU.textures)
+        {
+            alloc->destroy(tex);
+        }
+    }
+
+private:
+    nvvkhl::Application* m_app;
+
+    // cpu
+    struct Instance : nvh::Node
+    {
+        int texture_baseColor = -1;
+        int texture_normal    = -1;
+        int texture_emissive  = -1;
+        int texture_metalness = -1;
+        int texture_roughness = -1;
+        int texture_AO        = -1;
+    };
+    std::vector<nvh::PrimitiveMesh> m_primities;
+    std::vector<Instance>           m_instances;
+    std::vector<TextureCPU>         m_texturesCPU;
+    std::set<std::string>           m_textureLoaded;
+
+    // gpu
+    struct SceneDataGPU
+    {
+        std::vector<nvvk::Buffer>  vertexBuffer;
+        std::vector<nvvk::Buffer>  indexBuffer;
+        std::vector<nvvk::Texture> textures;
+    } m_sceneDataGPU;
+
+    void createSceneCPU(const std::string& filePath)
+    {
+        Assimp::Importer importer;
+        const aiScene*   scene =
+            importer.ReadFile(filePath, aiProcessPreset_TargetRealtime_MaxQuality);
+        if (!scene || scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE || !scene->mRootNode)
+        {
+            std::cout << "ERROR::ASSIMP::" << importer.GetErrorString() << std::endl;
+            throw std::runtime_error(std::string(importer.GetErrorString()));
+        }
+
+        // pre-allocate memory
+        m_primities.resize(scene->mNumMeshes, {});
+
+        // create primitives using meshes
+        for (uint32_t i = 0; i < scene->mNumMeshes; i++)
+        {
+            aiMesh* mesh = scene->mMeshes[i];
+            auto&   prim = m_primities[i];
+            prim.vertices.reserve(mesh->mNumVertices);
+            prim.triangles.reserve(mesh->mNumFaces);
+
+            // vertex
+            for (uint32_t j = 0; j < mesh->mNumVertices; j++)
+            {
+                nvh::PrimitiveVertex vertex{
+                    .p = toGlmVec3(mesh->mVertices[j]),
+                    .n = toGlmVec3(mesh->mNormals[j]),
+                    .t = toGlmVec2(mesh->mTextureCoords[0][j]),
+                };
+                prim.vertices.push_back(vertex);
+            }
+
+            // index
+            for (unsigned int j = 0; j < mesh->mNumFaces; j++)
+            {
+                aiFace&                face = mesh->mFaces[j];
+                nvh::PrimitiveTriangle index{
+                    glm::uvec3{
+                        face.mIndices[0],
+                        face.mIndices[1],
+                        face.mIndices[2],
+                    },
+                };
+                prim.triangles.push_back(index);
+            }
+
+            if (mesh->mMaterialIndex >= 0)
+            {
+                aiMaterial* mat = scene->mMaterials[mesh->mMaterialIndex];
+                for (auto textureType : {
+                         aiTextureType_BASE_COLOR,
+                         aiTextureType_NORMAL_CAMERA,
+                         aiTextureType_EMISSION_COLOR,
+                         aiTextureType_METALNESS,
+                         aiTextureType_DIFFUSE_ROUGHNESS,
+                         aiTextureType_AMBIENT_OCCLUSION,
+                     })
+                {
+                    if (mat->GetTextureCount(textureType) > 0)
+                    {
+                        aiString str;
+                        mat->GetTexture(textureType, 0, &str);  // always get the first texture
+                        if (m_textureLoaded.find(str.C_Str()) != m_textureLoaded.end())
+                        {
+                            // load texture
+                            m_texturesCPU.emplace_back(str.C_Str());
+                            m_textureLoaded.insert(str.C_Str());
+                        }
+                    }
+                }
+
+                // TODO - textures
+            }
+        }
+
+        processNode(scene->mRootNode, scene);  // TODO - create instance for nodes
+    }
+
+    void createSceneGPU(std::unique_ptr<nvvk::ResourceAllocator>& alloc)
+    {
+        m_sceneDataGPU.vertexBuffer.reserve(m_primities.size());
+        m_sceneDataGPU.indexBuffer.reserve(m_primities.size());
+        m_sceneDataGPU.textures.reserve(m_texturesCPU.size());
+
+        auto cmd = m_app->createTempCmdBuffer();
+        for (auto& prim : m_primities)
+        {
+            auto vertexBuffer = alloc->createBuffer(
+                cmd, prim.vertices, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            auto indexBuffer = alloc->createBuffer(
+                cmd, prim.triangles, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            m_sceneDataGPU.vertexBuffer.push_back(vertexBuffer);
+            m_sceneDataGPU.indexBuffer.push_back(indexBuffer);
+        }
+        for (auto& tex : m_texturesCPU)
+        {
+            // TODO -
+        }
+        m_app->submitAndWaitTempCmdBuffer(cmd);
+    }
+
+    void processNode(aiNode* node, const aiScene* scene)
+    {
+        // 处理节点所有的网格（如果有的话）
+        for (unsigned int i = 0; i < node->mNumMeshes; i++)
+        {
+            // TODO -
+        }
+
+        // 接下来对它的子节点重复这一过程
+        for (unsigned int i = 0; i < node->mNumChildren; i++)
+        {
+            processNode(node->mChildren[i], scene);
+        }
+    }
+};
+
+};  // namespace cookiekiss
+
 class SVGFElement : public nvvkhl::IAppElement {};
 
 class SimpleGraphicsElement : public nvvkhl::IAppElement {
@@ -70,7 +326,7 @@ public:
     {
         std::cout << "SimpleGraphicsElement onAttach()" << std::endl;
         m_app       = app;
-        m_allocator = std::make_unique<nvvk::ResourceAllocatorVma>(
+        m_allocator = std::make_shared<nvvk::ResourceAllocatorVma>(
             m_app->getInstance(), m_app->getDevice(), m_app->getPhysicalDevice());
         m_debug.setup(m_app->getDevice());
         loadScene();
@@ -193,20 +449,15 @@ public:
 
             5. normal 和 texcoord 明显有问题
             36顶点只有18法线而且有些法线明显有问题
+            载入模型的问题解决了
             */
 
         vkCmdEndRendering(cmd);
     }
 
 private:
-    struct SceneDataGPU
-    {
-        nvvk::Buffer vertexBuffer;
-        nvvk::Buffer indexBuffer;
-    };
-
     nvvkhl::Application*                     m_app;
-    std::unique_ptr<nvvk::ResourceAllocator> m_allocator;
+    std::shared_ptr<nvvk::ResourceAllocator> m_allocator;
     nvvk::DebugUtil                          m_debug;
 
     // resource
@@ -214,9 +465,7 @@ private:
     std::unique_ptr<nvvkhl::GBuffer> m_gbuffer;
 
     // Geometry
-    std::vector<nvh::PrimitiveMesh> m_primities;
-    std::vector<nvh::Node>          m_instances;
-    std::vector<SceneDataGPU>       m_sceneDataGPU;
+    cookiekiss::Scene m_scene;
 
     // pipeline
     nvvk::ShaderModuleManager   m_shaderManager;
@@ -309,7 +558,7 @@ private:
             },
         });
         // m_pipelineState.rasterizationState.frontFace = VK_FRONT_FACE_CLOCKWISE;
-        m_pipelineState.rasterizationState.cullMode  = VK_CULL_MODE_NONE;
+        m_pipelineState.rasterizationState.cullMode = VK_CULL_MODE_NONE;
         // NOTE - GraphicsPipelineState初始化一些常见的管线选项，比如动态视口大小
         // 所以在onRender函数中要手动调用vkCmdSetViewport
 
@@ -324,7 +573,7 @@ private:
     void loadScene()
     {
         // create scene primitives
-        m_primities = cookiekiss::loadGeometryFromFile(meshFile);
+        auto [m_primities, _] = cookiekiss::loadGeometryFromFile(meshFile, false);
 
         // create scene instances
         m_instances.reserve(m_primities.size());
