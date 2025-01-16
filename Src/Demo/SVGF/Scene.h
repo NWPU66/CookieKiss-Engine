@@ -18,16 +18,19 @@
 #include "nvh/cameramanipulator.hpp"
 #include "nvvk/buffers_vk.hpp"
 #include "nvvk/descriptorsets_vk.hpp"
+#include "nvvk/dynamicrendering_vk.hpp"
 #include "nvvk/pipeline_vk.hpp"
 #include "nvvk/resourceallocator_vk.hpp"
 #include "nvvk/shadermodulemanager_vk.hpp"
 #include "nvvkhl/application.hpp"
+#include "nvvkhl/gbuffer.hpp"
 #include "stb_image.h"
 #include <assimp/Importer.hpp>
 #include <assimp/postprocess.h>
 #include <assimp/scene.h>
 
 // users
+#include "Shader/common.h"
 
 namespace cookiekiss {
 
@@ -69,6 +72,8 @@ public:
         vkCmdBindIndexBuffer(cmd, indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
         vkCmdBindVertexBuffers(cmd, 0, std::size(offsets), &vertexBuffer.buffer, offsets);
     }
+
+    uint32_t getIndexCount() const { return indices.size(); }
 
     void createMesh(aiMesh* mesh, const aiScene* sceneData, Scene& scene)
     {
@@ -233,6 +238,8 @@ private:
 
 class TextureSet : public Object {
 public:
+    ~TextureSet() { destory(); }
+
     void bindingTextures(VkCommandBuffer cmd, VkPipelineLayout pipelineLayout)
     {
         VkDescriptorSet descSet[] = {m_descriptorSetContainer.getSet()};
@@ -242,6 +249,7 @@ public:
 
     void createTextureSet(aiMesh* mesh, const aiScene* sceneData, Scene& scene)
     {
+        // load textures, cpu side
         aiMaterial* material       = sceneData->mMaterials[mesh->mMaterialIndex];
         m_texture_baseColor        = loadTexture(material, aiTextureType_BASE_COLOR, scene);
         m_texture_normal           = loadTexture(material, aiTextureType_NORMALS, scene);
@@ -249,14 +257,60 @@ public:
         m_texture_roughness        = loadTexture(material, aiTextureType_DIFFUSE_ROUGHNESS, scene);
         m_texture_ambientOcclusion = loadTexture(material, aiTextureType_AMBIENT_OCCLUSION, scene);
 
-        // TODO - create descriptor set
+        // create descriptor set
         m_descriptorSetContainer.init(m_app->getDevice());
-        // m_descriptorSetContainer.addBinding();
+        m_descriptorSetContainer.addBinding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                            VK_SHADER_STAGE_FRAGMENT_BIT);
+        m_descriptorSetContainer.addBinding(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                            VK_SHADER_STAGE_FRAGMENT_BIT);
+        m_descriptorSetContainer.addBinding(2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                            VK_SHADER_STAGE_FRAGMENT_BIT);
+        m_descriptorSetContainer.addBinding(3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                            VK_SHADER_STAGE_FRAGMENT_BIT);
+        m_descriptorSetContainer.addBinding(4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                            VK_SHADER_STAGE_FRAGMENT_BIT);
         m_descriptorSetContainer.initLayout();
         m_descriptorSetContainer.initPool(1);
+
+        // modify descriptor set, gpu side
+        std::vector<VkWriteDescriptorSet> writeDescSets;
+        for (const auto& tex : {
+                 m_texture_baseColor,
+                 m_texture_normal,
+                 m_texture_metallic,
+                 m_texture_roughness,
+                 m_texture_ambientOcclusion,
+             })
+        {
+            auto descImageInfo = tex.lock()->getTexture().descriptor;
+            auto writeDescSet  = m_descriptorSetContainer.makeWrite(0, 0, &descImageInfo);
+            writeDescSets.push_back(writeDescSet);
+        }
+        vkUpdateDescriptorSets(m_app->getDevice(), writeDescSets.size(), writeDescSets.data(), 0,
+                               nullptr);
     }
 
-    VkDescriptorSetLayout getDescriptorSetLayout() { return m_descriptorSetContainer.getLayout(); }
+    static nvvk::DescriptorSetContainer& getDescriptorSetExample(VkDevice device)
+    {
+        static bool                         init = false;
+        static nvvk::DescriptorSetContainer descriptorSetContainer;
+        if (!init)
+        {
+            descriptorSetContainer.init(device);
+            descriptorSetContainer.addBinding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                              VK_SHADER_STAGE_FRAGMENT_BIT);
+            descriptorSetContainer.addBinding(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                              VK_SHADER_STAGE_FRAGMENT_BIT);
+            descriptorSetContainer.addBinding(2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                              VK_SHADER_STAGE_FRAGMENT_BIT);
+            descriptorSetContainer.addBinding(3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                              VK_SHADER_STAGE_FRAGMENT_BIT);
+            descriptorSetContainer.addBinding(4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                              VK_SHADER_STAGE_FRAGMENT_BIT);
+            descriptorSetContainer.initLayout();
+        }
+        return descriptorSetContainer;
+    }
 
 private:
     nvvk::DescriptorSetContainer m_descriptorSetContainer;
@@ -280,6 +334,8 @@ private:
     std::weak_ptr<Texture> m_texture_ambientOcclusion;
 
     std::shared_ptr<Texture> loadTexture(aiMaterial* material, aiTextureType type, Scene& scene);
+
+    void destory() { m_descriptorSetContainer.deinit(); }
 };
 
 class Pipeline : public Object {
@@ -292,7 +348,79 @@ class GraphicsPipeline : public Pipeline {
 public:
     ~GraphicsPipeline() override
     {
-        // TODO -
+        vkDestroyPipeline(m_app->getDevice(), m_pipeline, nullptr);
+        vkDestroyPipelineLayout(m_app->getDevice(), m_pipelineLayout, nullptr);
+        m_shaderManager.deinit();
+    }
+
+    void createPipeline(const std::string& vertShaderName,
+                        const std::string& fragShaderName,
+                        const std::string& shaderFolder)
+    {
+        // SMM
+        m_shaderManager.init(m_app->getDevice());
+        m_shaderManager.addDirectory(shaderFolder);
+        auto vid = m_shaderManager.createShaderModule(VK_SHADER_STAGE_VERTEX_BIT, vertShaderName);
+        auto fid = m_shaderManager.createShaderModule(VK_SHADER_STAGE_FRAGMENT_BIT, fragShaderName);
+
+        // renderingCreate
+        VkFormat                      colorAttachmentFormat = VK_FORMAT_R32G32B32A32_SFLOAT;
+        VkPipelineRenderingCreateInfo renderingCreateInfo{
+            .sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+            .pNext                   = nullptr,
+            .colorAttachmentCount    = 1,
+            .pColorAttachmentFormats = &colorAttachmentFormat,
+            .depthAttachmentFormat   = VK_FORMAT_D24_UNORM_S8_UINT,
+            .stencilAttachmentFormat = VK_FORMAT_D24_UNORM_S8_UINT,
+        };
+
+        // pipelineState
+        m_pipelineState.addBindingDescriptions({
+            VkVertexInputBindingDescription{
+                .binding   = 0,
+                .stride    = sizeof(VertexInput),
+                .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+            },
+
+        });
+        m_pipelineState.addAttributeDescriptions({
+            VkVertexInputAttributeDescription{
+                .location = 0,
+                .binding  = 0,
+                .format   = VK_FORMAT_R32G32B32_SFLOAT,  // postion
+                .offset   = offsetof(VertexInput, p),
+            },
+            VkVertexInputAttributeDescription{
+                .location = 1,
+                .binding  = 0,
+                .format   = VK_FORMAT_R32G32B32_SFLOAT,  // normal
+                .offset   = offsetof(VertexInput, n),
+            },
+            VkVertexInputAttributeDescription{
+                .location = 2,
+                .binding  = 0,
+                .format   = VK_FORMAT_R32G32_SFLOAT,  // texcoords
+                .offset   = offsetof(VertexInput, t),
+            },
+        });
+
+        // Other Settings
+        m_pipelineState.rasterizationState.cullMode = VK_CULL_MODE_NONE;
+
+        // create pipelayout
+        VkPushConstantRange pushConstantRange{
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            .offset     = 0,
+            .size       = sizeof(PushContent),
+        };
+        m_pipelineLayout = TextureSet::getDescriptorSetExample(m_app->getDevice())
+                               .initPipeLayout(1, &pushConstantRange);
+
+        nvvk::GraphicsPipelineGenerator generator(m_app->getDevice(), m_pipelineLayout,
+                                                  renderingCreateInfo, m_pipelineState);
+        generator.addShader(m_shaderManager.get(vid), VK_SHADER_STAGE_VERTEX_BIT);
+        generator.addShader(m_shaderManager.get(fid), VK_SHADER_STAGE_FRAGMENT_BIT);
+        m_pipeline = generator.createPipeline();
     }
 
     void bindingPipeline(VkCommandBuffer cmd) override
@@ -300,22 +428,41 @@ public:
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
     }
 
+    VkPipelineLayout getPipelineLayout() const { return m_pipelineLayout; }
+
 private:
     nvvk::ShaderModuleManager   m_shaderManager;
     nvvk::GraphicsPipelineState m_pipelineState;
     VkPipelineLayout            m_pipelineLayout;
     VkPipeline                  m_pipeline;
-
-    nvvk::DescriptorSetContainer m_descriptorSetContainer;  // TODO -
 };
 
 class Instance : public Object {
 public:
     void createInstance(aiMesh* mesh, const aiScene* sceneData, Scene& scene);
 
-    void draw(VkCommandBuffer cmd, glm::mat4 parentMatrix = glm::mat4(1))
+    void draw(VkCommandBuffer cmd, glm::mat4 vpMatrix, glm::mat4 parentMatrix = glm::mat4(1))
     {
-        // TODO -
+        // binding pipeline
+        m_pipeline.lock()->bindingPipeline(cmd);
+
+        // binding VBO
+        m_mesh.lock()->bindingVBO(cmd);
+
+        // binding texture
+        auto pipelineLayout =
+            dynamic_cast<GraphicsPipeline*>(m_pipeline.lock().get())->getPipelineLayout();
+        m_textureSet.lock()->bindingTextures(cmd, pipelineLayout);
+
+        // pc
+        auto        mMatrix = localMatrix();
+        PushContent pc{.m = mMatrix, .mvp = vpMatrix * mMatrix};
+        vkCmdPushConstants(cmd, pipelineLayout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc),
+                           &pc);
+
+        // draw
+        vkCmdDrawIndexed(cmd, m_mesh.lock()->getIndexCount(), 1, 0, 0, 0);
     }
 
 private:
@@ -341,16 +488,16 @@ class Node : public Object {
 public:
     void createNode(aiNode* node, const aiScene* sceneData, Scene& scene);
 
-    void draw(VkCommandBuffer cmd, glm::mat4 parentMatrix = glm::mat4(1))
+    void draw(VkCommandBuffer cmd, glm::mat4 vpMatrix, glm::mat4 parentMatrix = glm::mat4(1))
     {
         parentMatrix = parentMatrix * m_transform;
         for (auto& instance : m_instances)
         {
-            instance.lock()->draw(cmd, parentMatrix);
+            instance.lock()->draw(cmd, vpMatrix, parentMatrix);
         }
         for (auto& child : m_children)
         {
-            child.lock()->draw(cmd, parentMatrix);
+            child.lock()->draw(cmd, vpMatrix, parentMatrix);
         }
     }
 
@@ -403,7 +550,48 @@ public:
         m_nodes.clear();
     }
 
-    void draw(VkCommandBuffer cmd) { m_rootNode.lock()->draw(cmd); }
+    void draw(VkCommandBuffer cmd, nvvkhl::GBuffer& gbuffer)
+    {
+        // preparation for drawing
+        VkRect2D renderArea{
+            .offset = {0, 0},
+            .extent = gbuffer.getSize(),
+        };
+        nvvk::createRenderingInfo renderingInfo(renderArea, {gbuffer.getColorImageView()},
+                                                gbuffer.getDepthImageView());
+        vkCmdBeginRendering(cmd, (VkRenderingInfoKHR*)&renderingInfo);
+
+        // 手动设置viewport和scissor
+        VkExtent2D size = gbuffer.getSize();
+        VkViewport viewport{
+            .x        = 0.0f,
+            .y        = 0.0f,
+            .width    = (float)size.width,
+            .height   = (float)size.height,
+            .minDepth = 0.0f,
+            .maxDepth = 1.0f,
+        };
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        VkRect2D scissor{
+            .offset = {0, 0},
+            .extent = {size.width, size.height},
+        };
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+        // pre-calculate v and p
+        auto pMatrix = glm::perspectiveFovRH_ZO(glm::radians(45.0f), (float)size.width,
+                                                (float)size.height, 0.001f, 100.0f);
+        pMatrix[1][1] *= -1;
+        auto vMatrix  = CameraManip.getMatrix();
+        auto vpMatrix = pMatrix * vMatrix;
+        /*REVIEW - 我还是不理解这里为什么用 RH
+        vulkan的NDC空间就是右手系的，p[1][1]乘上-1后会变成左手系
+        */
+
+        // rendering
+        m_rootNode.lock()->draw(cmd, vpMatrix, glm::mat4(1));
+        vkCmdEndRendering(cmd);
+    }
 
 private:
     friend class Node;
